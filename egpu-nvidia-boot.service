@@ -1,0 +1,15 @@
+[Unit]
+Description=Stage the NVIDIA eGPU before the graphical session
+Documentation=https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1229
+After=local-fs.target systemd-udev-trigger.service
+Before=bolt.service display-manager.service
+
+[Service]
+Type=oneshot
+Environment=EGPU_LOCAL_RESERVE_BOOT_CONTEXT=1
+ExecStart=/etc/egpu-nvidia/egpu-boot.sh
+RemainAfterExit=yes
+TimeoutStartSec=45s
+
+[Install]
+WantedBy=graphical.target

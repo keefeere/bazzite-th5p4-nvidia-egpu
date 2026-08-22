@@ -1,0 +1,25 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "keefeere + Codex"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Inspect and safely detach a configured NVIDIA eGPU",
+        "Description[uk]": "Перевірка та безпечне від’єднання налаштованої NVIDIA eGPU",
+        "EnabledByDefault": true,
+        "Icon": "video-display",
+        "Id": "com.keefeere.egpu",
+        "License": "GPL-2.0-or-later",
+        "Name": "NVIDIA eGPU",
+        "Name[uk]": "NVIDIA eGPU",
+        "Version": "1.1.0"
+    },
+    "X-Plasma-API": "declarativeappletscript",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-MainScript": "ui/main.qml",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "Hardware"
+}

@@ -1,0 +1,7 @@
+[Unit]
+Description=Safely release the NVIDIA eGPU for USB4 hot-unplug
+After=egpu-nvidia-boot.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/egpu-nvidia/egpu-detach.sh

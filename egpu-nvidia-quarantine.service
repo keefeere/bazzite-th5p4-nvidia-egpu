@@ -1,0 +1,8 @@
+[Unit]
+Description=Safely initialize a late NVIDIA eGPU without restarting the graphical session
+After=egpu-nvidia-boot.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/egpu-nvidia/egpu-quarantine.sh
+TimeoutStartSec=30s

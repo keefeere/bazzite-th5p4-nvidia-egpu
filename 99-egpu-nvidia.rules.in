@@ -1,0 +1,12 @@
+# Generated from hardware.conf; do not edit this installed file directly.
+ACTION=="add|change", SUBSYSTEM=="thunderbolt", ATTR{vendor}=="@TH5P4_TB_VENDOR@", ATTR{device}=="@TH5P4_TB_DEVICE@", ATTR{device_name}=="@TH5P4_TB_NAME@", ENV{EGPU_NVIDIA_ENCLOSURE}="1"
+ACTION=="remove", SUBSYSTEM=="thunderbolt", ENV{EGPU_NVIDIA_ENCLOSURE}=="1", RUN+="/etc/egpu-nvidia/egpu-physical-unplug.sh"
+
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="@EGPU_VENDOR@", ATTR{device}=="@EGPU_DEVICE@", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="@EGPU_VENDOR@", ATTR{device}=="@EGPU_DEVICE@", TEST=="d3cold_allowed", ATTR{d3cold_allowed}="0"
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="@EGPU_AUDIO_VENDOR@", ATTR{device}=="@EGPU_AUDIO_DEVICE@", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="@EGPU_AUDIO_VENDOR@", ATTR{device}=="@EGPU_AUDIO_DEVICE@", TEST=="d3cold_allowed", ATTR{d3cold_allowed}="0"
+
+# The audio function enumerates last. Its add event serializes safe staged
+# initialization behind the normal early boot service.
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="@EGPU_AUDIO_VENDOR@", ATTR{device}=="@EGPU_AUDIO_DEVICE@", TAG+="systemd", ENV{SYSTEMD_WANTS}+="egpu-nvidia-quarantine.service"

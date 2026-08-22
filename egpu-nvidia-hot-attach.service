@@ -1,0 +1,7 @@
+[Unit]
+Description=Stage a hot-plugged NVIDIA eGPU and restart the graphical session
+After=systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/egpu-nvidia/egpu-hot-attach.sh
