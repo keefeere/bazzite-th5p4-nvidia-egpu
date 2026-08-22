@@ -196,4 +196,14 @@ reservation experiments (`install-pci-hotplug-reserve.sh` and
 `verify-pci-hotplug-reserve.sh`) are retained only as diagnostic history and
 must not be combined with the local profile.
 
+## Acknowledgements
+
+[all-ways-egpu](https://github.com/ewagner12/all-ways-egpu) by
+[@ewagner12](https://github.com/ewagner12) was an early reference and source of
+inspiration for making an eGPU primary on Wayland, particularly the compositor
+primary-GPU environment approach and the `thunderbolt.host_reset=0` workaround.
+No `all-ways-egpu` source code is vendored here; this project's hardware-specific
+PCI resource staging, NVIDIA initialization, downstream-dock handling and safe
+detach flow are separate implementations.
+
 License: GPL-2.0-or-later.
