@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 
-# Linux 7.2 changed how the PCI core normalizes empty hot-plug bridge windows
-# after this project's controlled TH5P4 remove/rescan.  Older kernels keep the
-# locally programmed windows without a global realloc request and must retain
-# that already validated behavior.
-EGPU_PCI_REALLOC_MIN_KERNEL="7.2.0"
+# Linux 7.2 stopped preserving the pre-programmed size of empty PCI bridge
+# memory windows during this project's controlled TH5P4 remove/rescan.  Bus
+# ranges still survive, but the allocator uses the standard hot-plug sizing
+# policy instead.  Request the measured 32 MiB minimum on those kernels only.
+#
+# Older kernels retain the already validated local-window flow unchanged.
+EGPU_PCI_COMPAT_MIN_KERNEL="7.2.0"
+EGPU_PCI_HOTPLUG_KARG="pci=hpmmiosize=32M,hpmmioprefsize=32M"
+EGPU_PCI_HOTPLUG_MMIO_BYTES=$((32 * 1024 * 1024))
+EGPU_PCI_HOTPLUG_PREF_BYTES=$((32 * 1024 * 1024))
+
+# Migration-only: an earlier, rejected 7.2 experiment used this argument.
+# It globally repacked the TH5P4 hierarchy at boot and must never be required.
 EGPU_PCI_REALLOC_KARG="pci=realloc=on"
 
 egpu_kernel_release_version() {
@@ -38,16 +46,16 @@ egpu_version_at_least() {
     (( current_patch >= minimum_patch ))
 }
 
-egpu_kernel_requires_pci_realloc() {
+egpu_kernel_requires_hotplug_sizing() {
     local version
 
     version=$(egpu_kernel_release_version "${1:-$(uname -r)}") || return 2
-    egpu_version_at_least "${version}" "${EGPU_PCI_REALLOC_MIN_KERNEL}"
+    egpu_version_at_least "${version}" "${EGPU_PCI_COMPAT_MIN_KERNEL}"
 }
 
 egpu_kernel_compat_mode() {
-    if egpu_kernel_requires_pci_realloc "${1:-$(uname -r)}"; then
-        printf '%s\n' realloc
+    if egpu_kernel_requires_hotplug_sizing "${1:-$(uname -r)}"; then
+        printf '%s\n' hotplug-size
     else
         case $? in
             1) printf '%s\n' legacy ;;
@@ -61,20 +69,53 @@ egpu_cmdline_has_arg() {
     [[ " ${cmdline} " == *" ${arg} "* ]]
 }
 
-egpu_managed_pci_realloc_action() {
+egpu_cmdline_has_pci_option() {
+    local cmdline=$1 wanted=$2 token option
+    local -a options
+
+    for token in ${cmdline}; do
+        [[ ${token} == pci=* ]] || continue
+        IFS=, read -r -a options <<< "${token#pci=}"
+        for option in "${options[@]}"; do
+            [[ ${option} == "${wanted}" || ${option} == "${wanted}="* ]] && return 0
+        done
+    done
+    return 1
+}
+
+egpu_managed_hotplug_size_action() {
     local release=$1 cmdline=$2 managed=${3:-0}
     local mode
 
     [[ ${managed} == 0 || ${managed} == 1 ]] || return 2
     mode=$(egpu_kernel_compat_mode "${release}") || return 2
-    if [[ ${mode} == realloc ]]; then
-        if egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_REALLOC_KARG}"; then
+    if [[ ${mode} == hotplug-size ]]; then
+        if egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_HOTPLUG_KARG}"; then
             printf '%s\n' keep
         else
             printf '%s\n' add
         fi
     elif [[ ${managed} == 1 ]]; then
-        printf '%s\n' remove
+        if egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_HOTPLUG_KARG}"; then
+            printf '%s\n' remove
+        else
+            printf '%s\n' cleanup
+        fi
+    else
+        printf '%s\n' keep
+    fi
+}
+
+egpu_managed_realloc_migration_action() {
+    local cmdline=$1 managed=${2:-0}
+
+    [[ ${managed} == 0 || ${managed} == 1 ]] || return 2
+    if [[ ${managed} == 1 ]]; then
+        if egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_REALLOC_KARG}"; then
+            printf '%s\n' remove
+        else
+            printf '%s\n' cleanup
+        fi
     else
         printf '%s\n' keep
     fi

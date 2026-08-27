@@ -11,6 +11,8 @@ PLASMOID_ID="com.keefeere.egpu"
 INITRAMFS_DRIVER_LIST="nvidia nvidia_drm nvidia_modeset nvidia_peermem nvidia_uvm"
 managed_pci_realloc=0
 [[ -e /etc/egpu-nvidia/managed-pci-realloc ]] && managed_pci_realloc=1
+managed_pci_hotplug=0
+[[ -e /etc/egpu-nvidia/managed-pci-hotplug-size ]] && managed_pci_hotplug=1
 
 desktop_home=""
 # Rollback must remain possible even if an edited installed profile is broken.
@@ -73,6 +75,9 @@ kargs_command=(
 )
 if (( managed_pci_realloc )); then
     kargs_command+=(--delete-if-present="pci=realloc=on")
+fi
+if (( managed_pci_hotplug )); then
+    kargs_command+=(--delete-if-present="pci=hpmmiosize=32M,hpmmioprefsize=32M")
 fi
 "${kargs_command[@]}"
 

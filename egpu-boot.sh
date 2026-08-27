@@ -131,14 +131,27 @@ if [[ -e ${LOCAL_RESERVE_ENABLE} ]]; then
         echo "Unsupported kernel release format: $(uname -r)" >&2
         exit 1
     }
-    if [[ ${kernel_compat_mode} == realloc ]]; then
-        if ! egpu_cmdline_has_arg "$(</proc/cmdline)" "${EGPU_PCI_REALLOC_KARG}"; then
+    if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+        if egpu_cmdline_has_arg "$(</proc/cmdline)" "${EGPU_PCI_REALLOC_KARG}"; then
             record_local_reserve_failure \
-                "kernel compatibility preflight (missing ${EGPU_PCI_REALLOC_KARG})" 1 || true
-            echo "Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+ requires the exact ${EGPU_PCI_REALLOC_KARG} compatibility argument for the controlled TH5P4 rescan." >&2
+                "kernel compatibility preflight (rejected ${EGPU_PCI_REALLOC_KARG})" 1 || true
+            echo "The rejected ${EGPU_PCI_REALLOC_KARG} mode globally repacks TH5P4 on Linux 7.2+." >&2
             echo "Rerun install-egpu-all.sh and reboot into its staged deployment." >&2
             exit 1
         fi
+        if ! egpu_cmdline_has_arg "$(</proc/cmdline)" "${EGPU_PCI_HOTPLUG_KARG}"; then
+            record_local_reserve_failure \
+                "kernel compatibility preflight (missing ${EGPU_PCI_HOTPLUG_KARG})" 1 || true
+            echo "Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+ requires the exact ${EGPU_PCI_HOTPLUG_KARG} compatibility argument for the controlled TH5P4 rescan." >&2
+            echo "Rerun install-egpu-all.sh and reboot into its staged deployment." >&2
+            exit 1
+        fi
+    elif egpu_cmdline_has_arg "$(</proc/cmdline)" "${EGPU_PCI_HOTPLUG_KARG}"; then
+        record_local_reserve_failure \
+            "legacy compatibility preflight (stale ${EGPU_PCI_HOTPLUG_KARG})" 1 || true
+        echo "The legacy kernel must retain the previously validated no-hotplug-sizing flow." >&2
+        echo "Rerun install-egpu-all.sh and reboot into its staged deployment." >&2
+        exit 1
     fi
 
     if [[ -s ${LOCAL_RESERVE_MARKER} ]]; then

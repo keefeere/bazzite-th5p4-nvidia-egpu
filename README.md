@@ -47,23 +47,30 @@ The read-only preflight reports any missing command before installation.
 The installer selects the PCI rescan behavior from the running kernel release:
 
 - kernels older than 7.2 keep the original validated path unchanged, without a
-  project-managed `pci=realloc=on` argument;
+  project-managed PCI sizing argument;
 - Linux 7.2 and newer use the same local TH5P4 register programming and strict
-  post-rescan verifier, with the standard `pci=realloc=on` pass enabled so the
-  PCI core can preserve/reassign the prepared hot-plug bridge windows.
+  post-rescan verifier, plus the exact
+  `pci=hpmmiosize=32M,hpmmioprefsize=32M` policy. Linux 7.2 no longer preserves
+  an oversized empty bridge window, so the measured 32 MiB dock minimum must
+  be supplied through the allocator's standard hot-plug sizing inputs.
 
-This is deliberately not a return to the retired global experiment. The stack
-never adds `pci=assign-busses`, `hpbussize`, `hpmmiosize` or
-`hpmmioprefsize`; firmware numbering and the AMD iGPU BDF remain untouched. If
-the new-kernel argument is absent, the early service fails closed before PCI
-surgery and the tray reports a PCI-reserve failure instead of calling its own
-internal rescan a physical reconnect.
+This is deliberately not a return to global PCI reassignment. A tested
+`pci=realloc=on` attempt repacked TH5P4 to buses `02-06` before the early
+service and was rejected. The stack never adds `pci=assign-busses` or
+`hpbussize`; firmware numbering and the AMD iGPU BDF remain untouched. The
+32 MiB values affect only how Linux sizes unassigned hot-plug memory windows;
+the machine-specific verifier still requires the exact local bus map,
+containment and non-overlap before NVIDIA can load. If the selected kernel
+argument is absent or the rejected realloc argument is active, the service
+fails closed.
 
 The installer records ownership only when it adds the exact
-`pci=realloc=on` argument itself. A rerun after booting an older kernel removes
-that project-owned argument and restores the legacy behavior. A pre-existing
-user-owned argument is preserved by both installation and rollback. After a
-major kernel update, rerun the installer and reboot before judging eGPU output.
+32 MiB sizing argument itself. A rerun after booting an older kernel removes
+that project-owned argument and restores the legacy behavior. The installer
+also migrates away the exact `pci=realloc=on` argument owned by the rejected
+earlier compatibility attempt. Pre-existing user-owned arguments are never
+silently deleted. After a major kernel update, rerun the installer and reboot
+before judging eGPU output.
 
 ## Install the bundled profile
 
@@ -218,7 +225,8 @@ dracut arguments such as encrypted-root support. The retired global PCI
 reservation experiments (`install-pci-hotplug-reserve.sh` and
 `verify-pci-hotplug-reserve.sh`) are retained only as diagnostic history and
 must not be combined with the local profile. It removes `pci=realloc=on` only
-when the version-aware installer recorded that this project added it.
+when the version-aware installer recorded that this project added it, and uses
+the same ownership rule for the Linux 7.2+ 32 MiB sizing argument.
 
 ## Acknowledgements
 

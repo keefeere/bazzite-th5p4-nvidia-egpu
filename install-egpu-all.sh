@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/etc/egpu-nvidia"
 PCI_REALLOC_OWNER_MARKER="${INSTALL_DIR}/managed-pci-realloc"
+PCI_HOTPLUG_OWNER_MARKER="${INSTALL_DIR}/managed-pci-hotplug-size"
 
 # shellcheck source=egpu-kernel-compat.sh
 source "${SOURCE_DIR}/egpu-kernel-compat.sh"
@@ -41,26 +42,55 @@ if [[ -z ${candidate_profile} ]]; then
 fi
 EGPU_CONFIG_FILE="${candidate_profile}" "${SOURCE_DIR}/egpu-config-preflight.sh"
 
-reject_global_pci_experiment() {
-    local args
+kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)") || {
+    echo "Unsupported kernel release format: $(uname -r)" >&2
+    exit 1
+}
 
-    args=" $(</proc/cmdline) "
-    if [[ ${args} == *' pci=assign-busses'* ||
-          ${args} == *'hpbussize='* ||
-          ${args} == *'hpmmiosize='* ||
-          ${args} == *'hpmmioprefsize='* ]]; then
-        echo "A retired global PCI reservation argument is active." >&2
-        echo "Rollback that deployment before installing the final local TH5P4 solution." >&2
+reject_unsupported_pci_arguments() {
+    local active staged label args token option
+    local -a options
+
+    active="$(</proc/cmdline)"
+    staged="$(rpm-ostree kargs 2>/dev/null || true)"
+    for label in active staged; do
+        if [[ ${label} == active ]]; then
+            args=${active}
+        else
+            args=${staged}
+        fi
+        for token in ${args}; do
+            [[ ${token} == pci=* ]] || continue
+            if [[ ${kernel_compat_mode} == hotplug-size &&
+                  ${token} == "${EGPU_PCI_HOTPLUG_KARG}" ]]; then
+                continue
+            fi
+            IFS=, read -r -a options <<< "${token#pci=}"
+            for option in "${options[@]}"; do
+                case ${option} in
+                    assign-busses|hpbussize=*|hpiosize=*|hpmemsize=*|hpmmiosize=*|hpmmioprefsize=*)
+                        echo "Unsupported PCI reservation option is ${label}: ${option}" >&2
+                        echo "Only ${EGPU_PCI_HOTPLUG_KARG} is accepted on Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+." >&2
+                        exit 1
+                        ;;
+                esac
+            done
+        done
+    done
+
+    # The stack-owned realloc experiment is allowed only long enough for this
+    # installer to migrate it out of the staged deployment. A user-owned copy
+    # remains a hard conflict because it repacks the TH5P4 hierarchy at boot.
+    if egpu_cmdline_has_arg "${staged}" "${EGPU_PCI_REALLOC_KARG}" &&
+       [[ ! -e ${PCI_REALLOC_OWNER_MARKER} ]]; then
+        echo "User-managed ${EGPU_PCI_REALLOC_KARG} is staged and conflicts with the local TH5P4 flow." >&2
         exit 1
     fi
-
-    args=" $(rpm-ostree kargs 2>/dev/null || true) "
-    if [[ ${args} == *' pci=assign-busses'* ||
-          ${args} == *'hpbussize='* ||
-          ${args} == *'hpmmiosize='* ||
-          ${args} == *'hpmmioprefsize='* ]]; then
-        echo "A retired global PCI reservation argument is staged in rpm-ostree." >&2
-        echo "Run remove-pci-hotplug-reserve.sh first." >&2
+    if egpu_cmdline_has_arg "${active}" "${EGPU_PCI_REALLOC_KARG}" &&
+       [[ ! -e ${PCI_REALLOC_OWNER_MARKER} ]] &&
+       { egpu_cmdline_has_arg "${staged}" "${EGPU_PCI_REALLOC_KARG}" ||
+         ! egpu_cmdline_has_arg "${staged}" "${EGPU_PCI_HOTPLUG_KARG}"; }; then
+        echo "Active ${EGPU_PCI_REALLOC_KARG} is not a recognized pending migration." >&2
         exit 1
     fi
 }
@@ -89,7 +119,7 @@ regenerate_initramfs_if_needed() {
     "${command[@]}"
 }
 
-reject_global_pci_experiment
+reject_unsupported_pci_arguments
 
 initramfs_config_changed=0
 for source in 99-nvidia.conf zz-egpu-delay.conf; do
@@ -104,16 +134,11 @@ install -D -m 0644 "${SOURCE_DIR}/99-egpu-delay-nvidia.conf" "/etc/modprobe.d/99
 
 # These two arguments prevent controller resets/low-power transitions that
 # were correlated with the original USB4/eGPU instability. Linux 7.2+ also
-# needs its standard PCI realloc pass enabled so the controlled TH5P4 rescan
-# retains the locally programmed bridge windows. Older kernels deliberately
-# keep the previously validated no-realloc path.
-kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)") || {
-    echo "Unsupported kernel release format: $(uname -r)" >&2
-    exit 1
-}
+# needs the measured 32 MiB hot-plug memory policy because its rewritten PCI
+# allocator no longer preserves oversized empty bridge windows. Older kernels
+# deliberately keep the previously validated flow byte-for-byte unchanged.
 current_kargs=" $(rpm-ostree kargs) "
 kargs_command=(rpm-ostree kargs)
-manage_pci_realloc=""
 for arg in thunderbolt.host_reset=0 thunderbolt.clx=0; do
     if [[ ${current_kargs} != *" ${arg} "* ]]; then
         kargs_command+=("--append-if-missing=${arg}")
@@ -121,37 +146,72 @@ for arg in thunderbolt.host_reset=0 thunderbolt.clx=0; do
 done
 managed_pci_realloc=0
 [[ -e ${PCI_REALLOC_OWNER_MARKER} ]] && managed_pci_realloc=1
-case $(egpu_managed_pci_realloc_action "$(uname -r)" "${current_kargs}" "${managed_pci_realloc}") in
-    add)
-        kargs_command+=("--append-if-missing=${EGPU_PCI_REALLOC_KARG}")
-        manage_pci_realloc=add
-        ;;
+manage_pci_realloc=$(egpu_managed_realloc_migration_action \
+    "${current_kargs}" "${managed_pci_realloc}") || {
+    echo "Could not select the rejected realloc migration action." >&2
+    exit 1
+}
+case ${manage_pci_realloc} in
     remove)
         kargs_command+=("--delete-if-present=${EGPU_PCI_REALLOC_KARG}")
-        manage_pci_realloc=remove
         ;;
-    keep) ;;
-    *) echo "Could not select a kernel PCI compatibility action." >&2; exit 1 ;;
+    keep|cleanup) ;;
+    *) echo "Invalid realloc migration action: ${manage_pci_realloc}" >&2; exit 1 ;;
+esac
+
+managed_pci_hotplug=0
+[[ -e ${PCI_HOTPLUG_OWNER_MARKER} ]] && managed_pci_hotplug=1
+manage_pci_hotplug=$(egpu_managed_hotplug_size_action \
+    "$(uname -r)" "${current_kargs}" "${managed_pci_hotplug}") || {
+    echo "Could not select the kernel PCI hot-plug sizing action." >&2
+    exit 1
+}
+case ${manage_pci_hotplug} in
+    add)
+        kargs_command+=("--append-if-missing=${EGPU_PCI_HOTPLUG_KARG}")
+        ;;
+    remove)
+        kargs_command+=("--delete-if-present=${EGPU_PCI_HOTPLUG_KARG}")
+        ;;
+    keep|cleanup) ;;
+    *) echo "Invalid hot-plug sizing action: ${manage_pci_hotplug}" >&2; exit 1 ;;
 esac
 if ((${#kargs_command[@]} > 2)); then
     "${kargs_command[@]}"
 else
     echo "The tested kernel arguments are already staged for ${kernel_compat_mode} PCI compatibility mode."
 fi
-if [[ ${manage_pci_realloc} == add ]]; then
-    install -D -m 0644 /dev/null "${PCI_REALLOC_OWNER_MARKER}"
-    echo "Staged ${EGPU_PCI_REALLOC_KARG} for Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+; this stack owns the exact argument."
-elif [[ ${manage_pci_realloc} == remove ]]; then
+if [[ ${manage_pci_realloc} == remove || ${manage_pci_realloc} == cleanup ]]; then
     rm -f -- "${PCI_REALLOC_OWNER_MARKER}"
-    echo "Removed the stack-managed ${EGPU_PCI_REALLOC_KARG}; the pre-${EGPU_PCI_REALLOC_MIN_KERNEL} flow remains unchanged."
-elif [[ ${kernel_compat_mode} == realloc ]]; then
-    if [[ -e ${PCI_REALLOC_OWNER_MARKER} ]]; then
-        echo "Stack-managed ${EGPU_PCI_REALLOC_KARG} is already staged for Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+."
+    echo "Removed the rejected stack-managed ${EGPU_PCI_REALLOC_KARG}."
+fi
+case ${manage_pci_hotplug} in
+    add)
+        install -D -m 0644 /dev/null "${PCI_HOTPLUG_OWNER_MARKER}"
+        echo "Staged ${EGPU_PCI_HOTPLUG_KARG} for Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+; this stack owns the exact argument."
+        ;;
+    remove|cleanup)
+        rm -f -- "${PCI_HOTPLUG_OWNER_MARKER}"
+        echo "Removed the stack-managed hot-plug sizing argument; the legacy flow remains unchanged."
+        ;;
+    keep)
+        if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+            if [[ -e ${PCI_HOTPLUG_OWNER_MARKER} ]]; then
+                echo "Stack-managed ${EGPU_PCI_HOTPLUG_KARG} is already staged."
+            else
+                echo "Existing user-managed ${EGPU_PCI_HOTPLUG_KARG} satisfies the Linux 7.2+ compatibility mode."
+            fi
+        else
+            echo "Using the unchanged legacy PCI flow on kernel $(uname -r)."
+        fi
+        ;;
+esac
+if egpu_cmdline_has_arg "$(</proc/cmdline)" "${EGPU_PCI_REALLOC_KARG}"; then
+    if ! egpu_cmdline_has_arg "$(rpm-ostree kargs)" "${EGPU_PCI_REALLOC_KARG}"; then
+        echo "The rejected realloc mode is still active only in this boot; reboot into the staged replacement before verification."
     else
-        echo "Existing user-managed ${EGPU_PCI_REALLOC_KARG} satisfies Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+ compatibility."
+        echo "WARNING: ${EGPU_PCI_REALLOC_KARG} remains staged unexpectedly." >&2
     fi
-else
-    echo "Using the unchanged legacy PCI flow on kernel $(uname -r)."
 fi
 
 regenerate_initramfs_if_needed "${initramfs_config_changed}"

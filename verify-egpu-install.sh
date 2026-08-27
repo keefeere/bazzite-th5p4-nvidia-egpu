@@ -47,19 +47,29 @@ else
     kernel_compat_mode=unknown
 fi
 
-if [[ ${kernel_compat_mode} == realloc ]]; then
+if [[ ${kernel_compat_mode} == hotplug-size ]]; then
     if egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_REALLOC_KARG}"; then
-        pass "Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+ compatibility argument ${EGPU_PCI_REALLOC_KARG} is active"
-        if [[ -e /etc/egpu-nvidia/managed-pci-realloc ]]; then
-            pass "version-aware installer owns the exact PCI realloc argument"
+        fail "rejected ${EGPU_PCI_REALLOC_KARG} is active and globally repacks TH5P4"
+    else
+        pass "rejected PCI realloc compatibility mode is inactive"
+    fi
+    if egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_HOTPLUG_KARG}"; then
+        pass "Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+ hot-plug sizing argument ${EGPU_PCI_HOTPLUG_KARG} is active"
+        if [[ -e /etc/egpu-nvidia/managed-pci-hotplug-size ]]; then
+            pass "version-aware installer owns the exact hot-plug sizing argument"
         else
-            pass "pre-existing user-managed PCI realloc argument is preserved"
+            pass "pre-existing user-managed hot-plug sizing argument is preserved"
         fi
     else
-        fail "Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+ requires active ${EGPU_PCI_REALLOC_KARG}; rerun the installer and reboot"
+        fail "Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+ requires active ${EGPU_PCI_HOTPLUG_KARG}; rerun the installer and reboot"
     fi
 elif [[ ${kernel_compat_mode} == legacy ]]; then
-    pass "pre-${EGPU_PCI_REALLOC_MIN_KERNEL} kernel retains the unchanged legacy PCI flow"
+    pass "pre-${EGPU_PCI_COMPAT_MIN_KERNEL} kernel retains the unchanged legacy PCI flow"
+    if [[ -e /etc/egpu-nvidia/managed-pci-hotplug-size ]]; then
+        fail "stale stack-managed ${EGPU_PCI_HOTPLUG_KARG} marker on a legacy kernel; rerun the installer"
+    elif egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_HOTPLUG_KARG}"; then
+        fail "legacy kernel is using the new-kernel ${EGPU_PCI_HOTPLUG_KARG}; rerun the installer"
+    fi
     if [[ -e /etc/egpu-nvidia/managed-pci-realloc ]]; then
         fail "stale stack-managed ${EGPU_PCI_REALLOC_KARG} marker on a legacy kernel; rerun the installer"
     elif egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_REALLOC_KARG}"; then
@@ -67,13 +77,22 @@ elif [[ ${kernel_compat_mode} == legacy ]]; then
     fi
 fi
 
-if [[ ${cmdline} == *' pci=assign-busses'* ||
-      ${cmdline} == *'hpbussize='* ||
-      ${cmdline} == *'hpmmiosize='* ||
-      ${cmdline} == *'hpmmioprefsize='* ]]; then
-    fail "retired global PCI reservation arguments are active"
+if egpu_cmdline_has_pci_option "${cmdline}" assign-busses; then
+    fail "global PCI bus numbering is active"
 else
     pass "firmware PCI numbering is preserved"
+fi
+if egpu_cmdline_has_pci_option "${cmdline}" hpbussize ||
+   egpu_cmdline_has_pci_option "${cmdline}" hpiosize ||
+   egpu_cmdline_has_pci_option "${cmdline}" hpmemsize; then
+    fail "unsupported global PCI hot-plug reservation arguments are active"
+elif { egpu_cmdline_has_pci_option "${cmdline}" hpmmiosize ||
+       egpu_cmdline_has_pci_option "${cmdline}" hpmmioprefsize; } &&
+     ! { [[ ${kernel_compat_mode} == hotplug-size ]] &&
+         egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_HOTPLUG_KARG}"; }; then
+    fail "unrecognized PCI hot-plug memory sizing argument is active"
+else
+    pass "no unsupported PCI hot-plug sizing arguments are active"
 fi
 
 for arg in thunderbolt.host_reset=0 thunderbolt.clx=0; do

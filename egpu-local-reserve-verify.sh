@@ -6,6 +6,20 @@ APPLIED_MARKER="/run/egpu-local-reserve-applied"
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
+# shellcheck source=egpu-kernel-compat.sh
+source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
+
+kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)") || {
+    echo "LOCAL TH5P4 RESERVE VERIFY FAILED: unsupported kernel release $(uname -r)" >&2
+    exit 1
+}
+if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+    required_p1_mmio=${EGPU_PCI_HOTPLUG_MMIO_BYTES}
+    required_p1_pref=${EGPU_PCI_HOTPLUG_PREF_BYTES}
+else
+    required_p1_mmio=${TARGET_MMIO_BYTES}
+    required_p1_pref=${TARGET_PREF_BYTES}
+fi
 
 die() {
     echo "LOCAL TH5P4 RESERVE VERIFY FAILED: $*" >&2
@@ -147,17 +161,19 @@ expect_inside "${up_pref_start}" "${up_pref_end}" "${p1_pref_start}" "${p1_pref_
 
 (( $(window_size "${p1_io_start}" "${p1_io_end}") >= MIN_IO_BYTES )) ||
     die "dock-port I/O reserve is smaller than the profile minimum"
-(( $(window_size "${p1_mem_start}" "${p1_mem_end}") >= TARGET_MMIO_BYTES )) ||
-    die "dock-port MMIO reserve is smaller than the profile target"
-(( $(window_size "${p1_pref_start}" "${p1_pref_end}") >= TARGET_PREF_BYTES )) ||
-    die "dock-port MMIO_PREF reserve is smaller than the profile target"
+(( $(window_size "${p1_mem_start}" "${p1_mem_end}") >= required_p1_mmio )) ||
+    die "dock-port MMIO reserve is smaller than the ${kernel_compat_mode} requirement"
+(( $(window_size "${p1_pref_start}" "${p1_pref_end}") >= required_p1_pref )) ||
+    die "dock-port MMIO_PREF reserve is smaller than the ${kernel_compat_mode} requirement"
 
 expect_before "${gpu_io_end}" "${p1_io_start}" "RTX/HP-port I/O"
 expect_before "${gpu_mem_end}" "${p1_mem_start}" "RTX/HP-port MMIO"
 expect_before "${gpu_pref_end}" "${p1_pref_start}" "RTX/HP-port MMIO_PREF"
 
-# Empty ports may remain disabled or receive Linux's 2 MiB optional windows.
-# If active, they must remain small, ordered and inside the TH5P4 parent.
+# On legacy kernels the two unused ports remain disabled or receive Linux's
+# 2 MiB defaults. Linux 7.2+ deliberately gives every empty hot-plug port the
+# measured 32 MiB minimum because its allocator no longer retains port1's
+# pre-programmed 128 MiB/1 GiB window.
 expect_disabled_window "${PORT2}" 14 "I/O"
 expect_disabled_window "${PORT3}" 14 "I/O"
 for prefix in p2_mem p2_pref p3_mem p3_pref; do
@@ -166,7 +182,14 @@ for prefix in p2_mem p2_pref p3_mem p3_pref; do
     end_name="${prefix}_end"
     if ((${!flags_name} != 0)); then
         size=$(window_size "${!start_name}" "${!end_name}")
-        ((size <= 2 * 1024 * 1024)) || die "${prefix} optional window exceeds 2 MiB"
+        if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+            ((size >= EGPU_PCI_HOTPLUG_MMIO_BYTES)) ||
+                die "${prefix} is smaller than the Linux 7.2+ hot-plug minimum"
+        else
+            ((size <= 2 * 1024 * 1024)) || die "${prefix} optional window exceeds 2 MiB"
+        fi
+    elif [[ ${kernel_compat_mode} == hotplug-size ]]; then
+        die "${prefix} hot-plug window is disabled on Linux 7.2+"
     fi
 done
 
@@ -198,7 +221,7 @@ done
 
 printf '%s\n' \
     "LOCAL TH5P4 RESERVE VERIFY PASSED." \
-    "  Dock port ${PORT1}: buses $(printf '%02x-%02x' "${PORT1_BUS_START}" "${PORT1_BUS_END}"), configured I/O/MMIO/MMIO_PREF reserves are present." \
+    "  Dock port ${PORT1}: buses $(printf '%02x-%02x' "${PORT1_BUS_START}" "${PORT1_BUS_END}"), ${kernel_compat_mode} I/O/MMIO/MMIO_PREF reserves are present." \
     "  ${IGPU_DISPLAY_NAME} remains ${IGPU}; ${EGPU_DISPLAY_NAME} remains ${GPU}."
 
 if [[ -s ${APPLIED_MARKER} ]]; then

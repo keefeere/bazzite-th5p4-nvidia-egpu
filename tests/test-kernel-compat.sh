@@ -41,29 +41,46 @@ expect_equal legacy "$(egpu_kernel_compat_mode 6.17.7-ba29.fc43.x86_64)" \
     "old validated kernel selects legacy mode"
 expect_equal legacy "$(egpu_kernel_compat_mode 7.1.99-test)" \
     "last pre-threshold kernel selects legacy mode"
-expect_equal realloc "$(egpu_kernel_compat_mode 7.2.0-ogc6.1.fc44.x86_64)" \
-    "new Bazzite kernel selects realloc mode"
-expect_equal realloc "$(egpu_kernel_compat_mode 8.0.0-test)" \
-    "future kernel remains on guarded realloc mode"
+expect_equal hotplug-size "$(egpu_kernel_compat_mode 7.2.0-ogc6.1.fc44.x86_64)" \
+    "new Bazzite kernel selects hot-plug sizing mode"
+expect_equal hotplug-size "$(egpu_kernel_compat_mode 8.0.0-test)" \
+    "future kernel remains on guarded hot-plug sizing mode"
 
-expect_equal keep "$(egpu_managed_pci_realloc_action 6.17.7 'quiet splash' 0)" \
-    "old kernel leaves its no-realloc flow untouched"
-expect_equal keep "$(egpu_managed_pci_realloc_action 6.17.7 'quiet pci=realloc=on' 0)" \
-    "old kernel preserves a user-owned realloc argument"
-expect_equal remove "$(egpu_managed_pci_realloc_action 6.17.7 'quiet pci=realloc=on' 1)" \
-    "old kernel removes only the stack-owned realloc argument"
-expect_equal add "$(egpu_managed_pci_realloc_action 7.2.0 'quiet splash' 0)" \
-    "new kernel adds its required realloc argument"
-expect_equal keep "$(egpu_managed_pci_realloc_action 7.2.0 'quiet pci=realloc=on' 0)" \
-    "new kernel preserves a pre-existing user-owned argument"
-expect_equal keep "$(egpu_managed_pci_realloc_action 7.2.0 'quiet pci=realloc=on' 1)" \
-    "new kernel keeps the stack-owned argument"
+new_karg='pci=hpmmiosize=32M,hpmmioprefsize=32M'
+expect_equal keep "$(egpu_managed_hotplug_size_action 6.17.7 'quiet splash' 0)" \
+    "old kernel leaves its validated flow untouched"
+expect_equal remove "$(egpu_managed_hotplug_size_action 6.17.7 "quiet ${new_karg}" 1)" \
+    "old kernel removes only the stack-owned new sizing argument"
+expect_equal cleanup "$(egpu_managed_hotplug_size_action 6.17.7 'quiet splash' 1)" \
+    "old kernel cleans a stale sizing ownership marker"
+expect_equal add "$(egpu_managed_hotplug_size_action 7.2.0 'quiet splash' 0)" \
+    "new kernel adds its required sizing argument"
+expect_equal keep "$(egpu_managed_hotplug_size_action 7.2.0 "quiet ${new_karg}" 0)" \
+    "new kernel preserves a pre-existing user-owned sizing argument"
+expect_equal keep "$(egpu_managed_hotplug_size_action 7.2.0 "quiet ${new_karg}" 1)" \
+    "new kernel keeps the stack-owned sizing argument"
+
+expect_equal remove "$(egpu_managed_realloc_migration_action 'quiet pci=realloc=on' 1)" \
+    "rejected stack-owned realloc argument is removed"
+expect_equal cleanup "$(egpu_managed_realloc_migration_action 'quiet splash' 1)" \
+    "stale realloc ownership marker is cleaned"
+expect_equal keep "$(egpu_managed_realloc_migration_action 'quiet pci=realloc=on' 0)" \
+    "user-owned realloc remains outside automatic deletion"
 
 if egpu_cmdline_has_arg 'quiet pci=realloc=on splash' 'pci=realloc=on' &&
    ! egpu_cmdline_has_arg 'quiet foo=pci=realloc=onward splash' 'pci=realloc=on'; then
     printf 'PASS  exact kernel argument matching\n'
 else
     printf 'FAIL  exact kernel argument matching\n' >&2
+    failures=$((failures + 1))
+fi
+
+if egpu_cmdline_has_pci_option "quiet ${new_karg}" hpmmiosize &&
+   egpu_cmdline_has_pci_option "quiet ${new_karg}" hpmmioprefsize &&
+   ! egpu_cmdline_has_pci_option "quiet ${new_karg}" hpbussize; then
+    printf 'PASS  combined PCI option parsing\n'
+else
+    printf 'FAIL  combined PCI option parsing\n' >&2
     failures=$((failures + 1))
 fi
 
