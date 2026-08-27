@@ -18,9 +18,12 @@ dm_stopped=0
 had_kwin_env=0
 nvidia_unloaded=0
 pci_branch_removed=0
+persistence_stopped=0
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
+# shellcheck source=egpu-cardwire-compat.sh
+source "${SCRIPT_DIR}/egpu-cardwire-compat.sh"
 
 exec 9>"${LOCK_FILE}"
 flock -x 9
@@ -40,6 +43,23 @@ restart_display_manager_on_error() {
         fi
     fi
     rm -f -- "${previous_kwin_env}"
+    if (( rc != 0 && persistence_stopped && ! nvidia_unloaded )) &&
+       grep -q '^nvidia ' /proc/modules; then
+        # nvidia-persistenced may remove nvidia-modprobe-created character
+        # devices when it stops. Recreate the nodes before restoring an
+        # NVIDIA-first login after a failed detach.
+        if command -v nvidia-modprobe >/dev/null 2>&1; then
+            nvidia-modprobe -c 0 || true
+            nvidia-modprobe -c 255 || true
+            if grep -q '^nvidia_uvm ' /proc/modules; then
+                nvidia-modprobe -u -c 0 -c 1 || true
+            fi
+            if grep -q '^nvidia_modeset ' /proc/modules; then
+                nvidia-modprobe -m || true
+            fi
+        fi
+        systemctl start nvidia-persistenced.service || true
+    fi
     if (( dm_stopped && (! nvidia_unloaded || pci_branch_removed) )); then
         systemctl start display-manager.service || true
     elif (( dm_stopped && nvidia_unloaded && ! pci_branch_removed )); then
@@ -48,6 +68,7 @@ restart_display_manager_on_error() {
     if (( rc != 0 )); then
         echo "eGPU detach failed; do not unplug the USB4 cable." >&2
     fi
+    egpu_resume_cardwire || true
     exit "${rc}"
 }
 trap restart_display_manager_on_error EXIT
@@ -120,6 +141,12 @@ rm -f -- "${tmp_env}"
 
 echo "Stopping the graphical session so KWin releases the NVIDIA DRM device..."
 
+# Cardwire 0.12+ runs as root and keeps GPU device nodes open while it builds
+# its eBPF access policy. Its block action only denies future opens; it is not
+# a driver detach. Stop the exact validated daemon before checking holders so
+# an unrelated root process still causes the normal fail-closed result.
+egpu_pause_cardwire
+
 # Remember the actual graphical login scopes. terminate-user proved racy on
 # this machine and could return while the Wayland session was still active.
 graphical_sessions=()
@@ -148,6 +175,7 @@ for session_id in "${graphical_sessions[@]}"; do
     loginctl terminate-session "${session_id}" || true
 done
 systemctl stop nvidia-persistenced.service
+persistence_stopped=1
 
 gpu_nodes=(
     "${egpu_card}"
@@ -296,6 +324,8 @@ echo "Starting the AMD-only login screen..."
 systemctl start display-manager.service
 systemctl is-active --quiet display-manager.service
 dm_stopped=0
+
+egpu_resume_cardwire || true
 
 printf '%s\n' \
     "NVIDIA modules are unloaded, HDMI/DP audio is unbound, and the exact eGPU PCI branch is removed." \

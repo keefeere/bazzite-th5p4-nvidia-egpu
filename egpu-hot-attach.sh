@@ -11,6 +11,9 @@ KWIN_ENV="/etc/environment.d/10kwin-egpu.conf"
 LOCK_FILE="/run/egpu-nvidia-transition.lock"
 dm_stopped=0
 
+# shellcheck source=egpu-cardwire-compat.sh
+source "${SCRIPT_DIR}/egpu-cardwire-compat.sh"
+
 restart_display_manager_on_error() {
     rc=$?
     trap - EXIT
@@ -18,6 +21,7 @@ restart_display_manager_on_error() {
         systemctl start display-manager.service || true
         echo "eGPU activation failed; restored the login screen." >&2
     fi
+    egpu_resume_cardwire || true
     exit "${rc}"
 }
 trap restart_display_manager_on_error EXIT
@@ -27,6 +31,12 @@ source "${SCRIPT_DIR}/egpu-pci-lib.sh"
 
 exec 9>"${LOCK_FILE}"
 flock -x 9
+
+# Cardwire reacts to DRM/PCI hotplug and can open NVIDIA nodes while this
+# script is still rebuilding and validating the exact branch. Pause it for the
+# whole transition; its previous active/inactive state is restored on every
+# exit path.
+egpu_pause_cardwire
 
 stop_desktop_for_transition() {
     local session_id session_uid session_class session_type
@@ -132,6 +142,8 @@ echo "Restarting the graphical session with NVIDIA as KWin primary..."
 stop_desktop_for_transition
 systemctl start display-manager.service
 dm_stopped=0
+
+egpu_resume_cardwire || true
 
 trap - EXIT
 echo "The NVIDIA eGPU was hot-attached at Gen3 x4."

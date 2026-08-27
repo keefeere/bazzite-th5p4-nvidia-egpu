@@ -105,6 +105,7 @@ done
 
 check_file /etc/egpu-nvidia/enable-local-reserve "local ${ENCLOSURE_DISPLAY_NAME} reservation enabled"
 check_file /etc/egpu-nvidia/hardware.conf "versioned hardware profile installed"
+check_file /etc/egpu-nvidia/egpu-cardwire-compat.sh "Cardwire transition compatibility installed"
 check_file /etc/egpu-nvidia/use-gen4 "persistent Gen4 preference enabled"
 check_file /etc/modprobe.d/99-egpu-delay-nvidia.conf "automatic NVIDIA module loading blocked"
 check_file /etc/dracut.conf.d/zz-egpu-delay.conf "NVIDIA omitted from locally generated initramfs"
@@ -130,6 +131,15 @@ if systemctl is-enabled --quiet egpu-nvidia-boot.service; then
     pass "early eGPU boot service enabled"
 else
     fail "egpu-nvidia-boot.service is not enabled"
+fi
+
+if systemctl cat cardwired.service >/dev/null 2>&1; then
+    boot_before=" $(systemctl show egpu-nvidia-boot.service -p Before --value 2>/dev/null || true) "
+    if [[ ${boot_before} == *" cardwired.service "* ]]; then
+        pass "early eGPU boot service is ordered before Cardwire"
+    else
+        fail "Cardwire is installed but may race early eGPU initialization"
+    fi
 fi
 
 if [[ $(systemctl is-enabled ublue-nvctk-cdi.service 2>/dev/null || true) == masked ]]; then

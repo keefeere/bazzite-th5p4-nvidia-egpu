@@ -57,6 +57,7 @@ install -m 0755 \
     "${SOURCE_DIR}/egpu-load-nvidia-gen3.sh" \
     "${SOURCE_DIR}/egpu-boot.sh" \
     "${SOURCE_DIR}/egpu-quarantine.sh" \
+    "${SOURCE_DIR}/egpu-cardwire-compat.sh" \
     "${SOURCE_DIR}/egpu-detach.sh" \
     "${SOURCE_DIR}/egpu-hot-attach.sh" \
     "${SOURCE_DIR}/egpu-physical-unplug.sh" \

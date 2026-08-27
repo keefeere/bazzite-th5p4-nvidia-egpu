@@ -168,6 +168,15 @@ This changes only the text/fallback console owner—NVIDIA DRM modesetting remai
 enabled for KWin and the external displays. A detach failure restores the
 previous NVIDIA-first KWin order before restarting the display manager.
 
+Bazzite images that include [Cardwire](https://github.com/OpenGamingCollective/cardwire)
+are handled explicitly. Cardwire's eBPF GPU block prevents new applications
+from opening a device, but it is not a PCI/driver detach and the root
+`cardwired` daemon can itself retain NVIDIA device nodes. The transition
+scripts validate and temporarily stop exactly `cardwired.service`, then restore
+its previous active state after detach, reattach, or rollback. The early eGPU
+service is also ordered before Cardwire so the daemon cannot race the guarded
+NVIDIA initialization.
+
 ## Guarded Gen4
 
 A Gen4 request is consumed before link retraining and re-created only after a
