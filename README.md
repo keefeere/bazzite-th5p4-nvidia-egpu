@@ -151,7 +151,12 @@ enclosure or change Thunderbolt authorization. This prevents desktop power
 helpers from probing a live but driverless GPU. While the released enclosure
 remains physically connected, the widget offers **Connect eGPU** / **Підключити
 eGPU**; this performs a validated upstream rescan, clears the latch and starts
-a new NVIDIA-first session at conservative Gen3.
+a new NVIDIA-first session at conservative Gen3. On Linux 7.2+, a child-only
+rescan can incorrectly give the RTX I/O window to an unused TH5P4 hot-plug
+port. In that compatibility mode, reattach first validates and recycles only
+the released RTX port plus the two exact empty sibling ports. The active HP
+Dock branch is not removed. Pre-7.2 kernels retain the previously validated
+child-only rescan.
 
 Physically unplugging the enclosure invalidates the runtime bridge reservation.
 On this validated machine, a same-boot cable replug enumerates the RTX with a

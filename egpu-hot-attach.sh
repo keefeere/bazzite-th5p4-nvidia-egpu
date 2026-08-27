@@ -9,7 +9,12 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 KWIN_ENV="/etc/environment.d/10kwin-egpu.conf"
 LOCK_FILE="/run/egpu-nvidia-transition.lock"
+SAFE_MARKER="/run/egpu-safe-to-unplug"
+DETACH_BLOCK_MARKER="/run/egpu-nvidia-detach-block"
+LOCAL_RESERVE_MARKER="/run/egpu-local-reserve-applied"
+REBOOT_MARKER="/run/egpu-nvidia-reboot-required"
 dm_stopped=0
+pci_repair_started=0
 
 # shellcheck source=egpu-cardwire-compat.sh
 source "${SCRIPT_DIR}/egpu-cardwire-compat.sh"
@@ -17,6 +22,10 @@ source "${SCRIPT_DIR}/egpu-cardwire-compat.sh"
 restart_display_manager_on_error() {
     rc=$?
     trap - EXIT
+    if (( rc != 0 && pci_repair_started )); then
+        install -D -m 0644 /dev/null "${REBOOT_MARKER}"
+        echo "The controlled PCI reattach repair failed; NVIDIA remains blocked. Reboot with the enclosure connected." >&2
+    fi
     if (( rc != 0 && dm_stopped )); then
         systemctl start display-manager.service || true
         echo "eGPU activation failed; restored the login screen." >&2
@@ -28,6 +37,8 @@ trap restart_display_manager_on_error EXIT
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
+# shellcheck source=egpu-kernel-compat.sh
+source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
 
 exec 9>"${LOCK_FILE}"
 flock -x 9
@@ -74,11 +85,167 @@ stop_desktop_for_transition() {
     fi
 }
 
+pci_branch_has_descendants() {
+    local ancestor=$1
+    local sysfs bdf
+
+    for sysfs in /sys/bus/pci/devices/0000:*; do
+        bdf=${sysfs##*/}
+        [[ ${bdf} == "${ancestor}" ]] && continue
+        if is_pci_descendant_of "${bdf}" "${ancestor}"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_gpu_branch_children() {
+    local bridge=$1
+    local sysfs bdf
+
+    for sysfs in /sys/bus/pci/devices/0000:*; do
+        bdf=${sysfs##*/}
+        [[ ${bdf} == "${bridge}" ]] && continue
+        if is_pci_descendant_of "${bdf}" "${bridge}"; then
+            case ${bdf} in
+                "${EXPECTED_GPU_BDF}"|"${EXPECTED_AUDIO_BDF}") ;;
+                *)
+                    echo "Unexpected PCI descendant ${bdf} below the released RTX port ${bridge}." >&2
+                    return 1
+                    ;;
+            esac
+        fi
+    done
+}
+
+repair_hotplug_size_reattach() {
+    local upstream=${EXPECTED_TH5P4_UPSTREAM_BDF}
+    local gpu_bridge=${EXPECTED_GPU_BRIDGE_BDF}
+    local bridge_prefix=${EXPECTED_GPU_BRIDGE_BDF%:*}
+    local dock_port="${bridge_prefix}:01.0"
+    local spare_port2="${bridge_prefix}:02.0"
+    local spare_port3="${bridge_prefix}:03.0"
+    local port dock_nic audio_driver
+
+    [[ -s ${SAFE_MARKER} && -e ${DETACH_BLOCK_MARKER} ]] || {
+        echo "The same-cable detach latch is absent; refusing a live PCI repair." >&2
+        return 1
+    }
+    [[ -s ${LOCAL_RESERVE_MARKER} ]] || {
+        echo "The validated runtime PCI reserve marker is absent." >&2
+        return 1
+    }
+    if grep -q '^nvidia' /proc/modules; then
+        echo "NVIDIA is unexpectedly loaded during a released-branch repair." >&2
+        return 1
+    fi
+    th5p4_router_present || {
+        echo "${ENCLOSURE_DISPLAY_NAME} is physically disconnected; reconnect it and reboot to restore PCI resources." >&2
+        return 1
+    }
+    [[ $(pci_id_at "${upstream}" 2>/dev/null || true) == "${TH5P4_VENDOR}:${TH5P4_DEVICE}" ]] || {
+        echo "Refusing reattach: the configured ${ENCLOSURE_DISPLAY_NAME} upstream bridge is absent." >&2
+        return 1
+    }
+
+    for port in "${dock_port}" "${spare_port2}" "${spare_port3}"; do
+        [[ $(pci_id_at "${port}" 2>/dev/null || true) == "${TH5P4_VENDOR}:${TH5P4_DEVICE}" ]] || {
+            echo "Refusing reattach: expected ${ENCLOSURE_DISPLAY_NAME} port ${port} is absent or changed." >&2
+            return 1
+        }
+    done
+    for port in "${spare_port2}" "${spare_port3}"; do
+        if pci_branch_has_descendants "${port}"; then
+            echo "Refusing reattach: nominally empty ${ENCLOSURE_DISPLAY_NAME} port ${port} has a descendant." >&2
+            return 1
+        fi
+    done
+
+    if [[ -d /sys/bus/pci/devices/${gpu_bridge} ]]; then
+        [[ $(pci_id_at "${gpu_bridge}" 2>/dev/null || true) == "${TH5P4_VENDOR}:${TH5P4_DEVICE}" ]] || {
+            echo "The returned RTX bridge ${gpu_bridge} has an unexpected PCI ID." >&2
+            return 1
+        }
+        resolve_egpu_topology
+        validate_expected_topology
+        validate_gpu_branch_children "${gpu_bridge}"
+        audio_driver="$(basename -- "$(readlink -f "/sys/bus/pci/devices/${EXPECTED_AUDIO_BDF}/driver" 2>/dev/null || true)")"
+        if [[ ${audio_driver} == snd_hda_intel ]]; then
+            echo "${EXPECTED_AUDIO_BDF}" > /sys/bus/pci/drivers/snd_hda_intel/unbind
+        fi
+    fi
+
+    if [[ ${HP_DOCK_SUPPORT} == 1 ]] && hp_dock_router_present; then
+        dock_nic="$(find_unique_pci_device "${HP_DOCK_NIC_VENDOR}" "${HP_DOCK_NIC_DEVICE}" 2>/dev/null || true)"
+        [[ -n ${dock_nic} &&
+           $(<"/sys/bus/pci/devices/${dock_nic}/subsystem_vendor") == "${HP_DOCK_NIC_SUBSYSTEM_VENDOR}" &&
+           $(<"/sys/bus/pci/devices/${dock_nic}/subsystem_device") == "${HP_DOCK_NIC_SUBSYSTEM_DEVICE}" ]] || {
+            echo "The configured ${DOCK_DISPLAY_NAME} NIC changed before the RTX-only repair." >&2
+            return 1
+        }
+        is_pci_descendant_of "${dock_nic}" "${dock_port}" || {
+            echo "The configured ${DOCK_DISPLAY_NAME} NIC is outside its validated port." >&2
+            return 1
+        }
+    fi
+
+    pci_repair_started=1
+    echo "Recycling only the released RTX port and two validated empty ${ENCLOSURE_DISPLAY_NAME} ports..."
+    if [[ -d /sys/bus/pci/devices/${gpu_bridge} ]]; then
+        echo 1 > "/sys/bus/pci/devices/${gpu_bridge}/remove"
+    fi
+    echo 1 > "/sys/bus/pci/devices/${spare_port2}/remove"
+    echo 1 > "/sys/bus/pci/devices/${spare_port3}/remove"
+
+    for _ in {1..50}; do
+        [[ ! -d /sys/bus/pci/devices/${gpu_bridge} &&
+           ! -d /sys/bus/pci/devices/${spare_port2} &&
+           ! -d /sys/bus/pci/devices/${spare_port3} ]] && break
+        sleep 0.1
+    done
+    [[ ! -d /sys/bus/pci/devices/${gpu_bridge} &&
+       ! -d /sys/bus/pci/devices/${spare_port2} &&
+       ! -d /sys/bus/pci/devices/${spare_port3} ]]
+
+    echo "Rescanning the validated ${ENCLOSURE_DISPLAY_NAME} ports with RTX first..."
+    echo 1 > "/sys/bus/pci/devices/${upstream}/rescan"
+    for _ in {1..50}; do
+        [[ -d /sys/bus/pci/devices/${EXPECTED_GPU_BDF} &&
+           -d /sys/bus/pci/devices/${spare_port2} &&
+           -d /sys/bus/pci/devices/${spare_port3} ]] && break
+        sleep 0.1
+    done
+    [[ -d /sys/bus/pci/devices/${EXPECTED_GPU_BDF} &&
+       -d /sys/bus/pci/devices/${spare_port2} &&
+       -d /sys/bus/pci/devices/${spare_port3} ]]
+
+    resolve_egpu_topology
+    validate_expected_topology
+    audio_driver="$(basename -- "$(readlink -f "/sys/bus/pci/devices/${AUDIO}/driver" 2>/dev/null || true)")"
+    if [[ ${audio_driver} == snd_hda_intel ]]; then
+        echo "${AUDIO}" > /sys/bus/pci/drivers/snd_hda_intel/unbind
+    fi
+    if [[ ${HP_DOCK_SUPPORT} == 1 ]] && hp_dock_router_present; then
+        "${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
+    else
+        "${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
+    fi
+    if grep -q '^nvidia' /proc/modules; then
+        echo "NVIDIA loaded unexpectedly during the controlled RTX-port repair." >&2
+        return 1
+    fi
+
+    pci_repair_started=0
+    rm -f -- "${REBOOT_MARKER}"
+    echo "The Linux 7.2+ same-cable RTX port repair passed."
+}
+
 # Safe detach removes the exact GPU bridge while deliberately leaving the
-# TH5P4 router and USB tunnel alive. If the cable is still attached, recreate
-# only that child branch before clearing the latch. The expected upstream BDF
-# and PCI ID are profile-validated so this cannot rescan an arbitrary bridge.
-if [[ -s /run/egpu-safe-to-unplug ]] && ! resolve_egpu_gpu; then
+# TH5P4 router and USB tunnel alive. Linux 7.2+ can give the RTX I/O window to
+# an empty hot-plug port during a child-only rescan. Recycle only those exact
+# empty siblings so deterministic BDF scan order gives the RTX port its window
+# first. Older kernels retain the previously validated child-only rescan.
+if [[ -s ${SAFE_MARKER} ]]; then
     th5p4_router_present || {
         echo "${ENCLOSURE_DISPLAY_NAME} is physically disconnected; reconnect it and reboot to restore PCI resources." >&2
         exit 1
@@ -88,16 +255,21 @@ if [[ -s /run/egpu-safe-to-unplug ]] && ! resolve_egpu_gpu; then
         echo "Refusing reattach: expected ${ENCLOSURE_DISPLAY_NAME} upstream ${EXPECTED_TH5P4_UPSTREAM_BDF}, found ${upstream_id:-nothing}." >&2
         exit 1
     fi
-    echo "Rescanning the released ${ENCLOSURE_DISPLAY_NAME} GPU port..."
-    echo 1 > "/sys/bus/pci/devices/${EXPECTED_TH5P4_UPSTREAM_BDF}/rescan"
-    for _ in {1..25}; do
-        resolve_egpu_gpu && break
-        sleep 0.2
-    done
-    resolve_egpu_gpu || {
-        echo "${EGPU_DISPLAY_NAME} did not return after the validated upstream rescan." >&2
-        exit 1
-    }
+    kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)")
+    if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+        repair_hotplug_size_reattach
+    elif ! resolve_egpu_gpu; then
+        echo "Rescanning the released ${ENCLOSURE_DISPLAY_NAME} GPU port..."
+        echo 1 > "/sys/bus/pci/devices/${EXPECTED_TH5P4_UPSTREAM_BDF}/rescan"
+        for _ in {1..25}; do
+            resolve_egpu_gpu && break
+            sleep 0.2
+        done
+        resolve_egpu_gpu || {
+            echo "${EGPU_DISPLAY_NAME} did not return after the validated upstream rescan." >&2
+            exit 1
+        }
+    fi
 fi
 
 # A full cable removal destroys the programmed PCI bridge state and can return
@@ -124,8 +296,9 @@ if (( ! reserve_valid )); then
 fi
 
 rm -f -- \
-    /run/egpu-safe-to-unplug \
-    /run/egpu-nvidia-detach-block \
+    "${SAFE_MARKER}" \
+    "${DETACH_BLOCK_MARKER}" \
+    "${REBOOT_MARKER}" \
     /run/egpu-nvidia-late-loaded \
     /run/egpu-nvidia-hotplug-pending
 

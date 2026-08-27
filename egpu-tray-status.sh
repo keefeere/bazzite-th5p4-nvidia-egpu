@@ -41,17 +41,6 @@ emit() {
     exit 0
 }
 
-if [[ -s ${SAFE_MARKER} ]]; then
-    if ! th5p4_router_present; then
-        emit absent \
-            "$(tr "eGPU is disconnected" "eGPU не підключена")" \
-            "$(tr "The released ${ENCLOSURE_DISPLAY_NAME} is no longer connected." "Відпущений ${ENCLOSURE_DISPLAY_NAME} більше не підключений.")"
-    fi
-    emit safe \
-        "$(tr "Safe to unplug" "Можна від’єднувати")" \
-        "$(tr "The GPU is released. Unplug the cable, or click Connect eGPU while it remains attached." "GPU відпущено. Від’єднай кабель або натисни «Підключити eGPU», поки він лишається підключеним.")"
-fi
-
 if systemctl is-active --quiet "${ATTACH_SERVICE}"; then
     emit attaching \
         "$(tr "Connecting eGPU…" "Підключення eGPU…")" \
@@ -70,6 +59,28 @@ if systemctl is-failed --quiet "${DETACH_SERVICE}"; then
         "$(tr "Do not unplug the cable. Check ${DETACH_SERVICE}." "Кабель не від’єднувати. Перевір ${DETACH_SERVICE}.")"
 fi
 
+if systemctl is-failed --quiet "${ATTACH_SERVICE}"; then
+    if [[ -s ${SAFE_MARKER} ]]; then
+        emit error \
+            "$(tr "eGPU connection failed" "Помилка підключення eGPU")" \
+            "$(tr "The GPU remains safely released. Reboot with the enclosure attached, or unplug its cable." "GPU лишається безпечно відпущеною. Перезавантаж систему з підключеним корпусом або від’єднай його кабель.")"
+    fi
+    emit error \
+        "$(tr "eGPU connection failed" "Помилка підключення eGPU")" \
+        "$(tr "NVIDIA stayed blocked. Check ${ATTACH_SERVICE}." "NVIDIA лишилася заблокованою. Перевір ${ATTACH_SERVICE}.")"
+fi
+
+if [[ -s ${SAFE_MARKER} ]]; then
+    if ! th5p4_router_present; then
+        emit absent \
+            "$(tr "eGPU is disconnected" "eGPU не підключена")" \
+            "$(tr "The released ${ENCLOSURE_DISPLAY_NAME} is no longer connected." "Відпущений ${ENCLOSURE_DISPLAY_NAME} більше не підключений.")"
+    fi
+    emit safe \
+        "$(tr "Safe to unplug" "Можна від’єднувати")" \
+        "$(tr "The GPU is released. Unplug the cable, or click Connect eGPU while it remains attached." "GPU відпущено. Від’єднай кабель або натисни «Підключити eGPU», поки він лишається підключеним.")"
+fi
+
 if [[ -s ${LOCAL_RESERVE_FAILURE_MARKER} ]]; then
     emit error \
         "$(tr "PCI reserve failed" "Помилка резервування PCI")" \
@@ -81,7 +92,7 @@ if [[ -e ${REBOOT_MARKER} ]] ||
         ! -s /run/egpu-local-reserve-applied ]] && resolve_egpu_gpu; }; then
     emit reboot \
         "$(tr "Reboot required" "Потрібне перезавантаження")" \
-        "$(tr "The enclosure was physically reconnected. Reboot with it attached to restore validated PCI resources." "Корпус було фізично перепідключено. Перезавантаж систему з підключеним корпусом для відновлення перевірених PCI-ресурсів.")"
+        "$(tr "Validated PCI resources could not be restored live. Reboot with the enclosure attached." "Перевірені PCI-ресурси не вдалося відновити наживо. Перезавантаж систему з підключеним корпусом.")"
 fi
 
 if ! resolve_egpu_gpu; then
