@@ -166,8 +166,13 @@ udevadm control --reload-rules
 # alter authorization, PCI resources or the live NVIDIA stack.
 if th5p4_router_present; then
     th5p4_router="$(find_th5p4_router_dir)"
-    udevadm trigger --action=change "${th5p4_router}"
-    udevadm settle
+    # Wait only for this synthetic event. A global `udevadm settle` can time
+    # out behind unrelated long-running input/device jobs and must never turn
+    # successful installation into a false failure. A coldplug on the next
+    # boot will seed the same tag even if this best-effort refresh fails.
+    if ! udevadm trigger --action=change --settle "${th5p4_router}"; then
+        echo "Warning: the live ${ENCLOSURE_DISPLAY_NAME} udev tag refresh timed out; next boot will seed it normally." >&2
+    fi
 fi
 systemctl reset-failed \
     egpu-nvidia-detach.service \
