@@ -10,11 +10,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STAGE_SCRIPT="${SCRIPT_DIR}/egpu-stage-gen3.sh"
 TARGET_GENERATION="${EGPU_PCIE_GENERATION:-3}"
 MODPROBE_CONFIG="${SCRIPT_DIR}/nvidia-base-only.conf"
+NVIDIA_POLICY_LIB="${SCRIPT_DIR}/egpu-nvidia-policy.sh"
 PENDING_MARKER="/run/egpu-nvidia-hotplug-pending"
 LATE_MARKER="/run/egpu-nvidia-late-loaded"
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
+# shellcheck source=egpu-nvidia-policy.sh
+source "${NVIDIA_POLICY_LIB}"
 resolve_egpu_topology
 
 case "${TARGET_GENERATION}" in
@@ -25,7 +28,7 @@ esac
 
 trap 'rc=$?; echo "eGPU driver staging failed at line ${LINENO} (exit ${rc}). Do not unplug the eGPU until the loaded-module state has been checked." >&2; exit "${rc}"' ERR
 
-for required_file in "${STAGE_SCRIPT}" "${MODPROBE_CONFIG}"; do
+for required_file in "${STAGE_SCRIPT}" "${MODPROBE_CONFIG}" "${NVIDIA_POLICY_LIB}"; do
     if [[ ! -r ${required_file} ]]; then
         echo "Required file is missing: ${required_file}" >&2
         exit 1
@@ -41,7 +44,12 @@ echo "[1/8] Fixing the eGPU PCIe link at ${generation_label} x4..."
 "${STAGE_SCRIPT}"
 
 echo "[2/8] Loading the NVIDIA core module only..."
-modprobe -C "${MODPROBE_CONFIG}" nvidia
+nvidia_module_options=()
+if egpu_nvidia_host_has_contiguous_policy; then
+    nvidia_module_options+=("${EGPU_NVIDIA_CONTIGUOUS_POLICY}")
+    echo "Mirroring the active Bazzite contiguous-allocation policy for Gamescope scanout."
+fi
+modprobe -C "${MODPROBE_CONFIG}" nvidia "${nvidia_module_options[@]}"
 
 # Bazzite's NVIDIA udev rule changes this back to auto when the driver binds.
 # Override it after the bind so the eGPU cannot enter runtime D3.

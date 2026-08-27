@@ -14,6 +14,7 @@ DETACH_BLOCK_MARKER="/run/egpu-nvidia-detach-block"
 LOCAL_RESERVE_MARKER="/run/egpu-local-reserve-applied"
 REBOOT_MARKER="/run/egpu-nvidia-reboot-required"
 PCIEHP_QUARANTINE_MARKER="/run/egpu-pciehp-quarantined"
+RELEASED_UNPLUGGED_MARKER="/run/egpu-nvidia-released-unplugged"
 dm_stopped=0
 pci_repair_started=0
 
@@ -47,6 +48,15 @@ kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)") || {
 
 exec 9>"${LOCK_FILE}"
 flock -x 9
+
+# Do not let a manual systemctl invocation turn a completed safe physical
+# detach into an unvalidated same-boot reconnect. The experimental first-
+# hotplug repair is reserved for a boot that started without the enclosure.
+if [[ -s ${RELEASED_UNPLUGGED_MARKER} ]]; then
+    echo "The eGPU was safely unplugged earlier in this boot." >&2
+    echo "Same-boot physical reattach is unsupported; reboot with the enclosure attached." >&2
+    exit 1
+fi
 
 # Cardwire reacts to DRM/PCI hotplug and can open NVIDIA nodes while this
 # script is still rebuilding and validating the exact branch. Pause it for the
@@ -177,7 +187,8 @@ repair_physical_hotplug_rebar() {
     local upstream=${EXPECTED_TH5P4_UPSTREAM_BDF}
     local gpu_bridge=${EXPECTED_GPU_BRIDGE_BDF}
     local bridge_prefix=${EXPECTED_GPU_BRIDGE_BDF%:*}
-    local port audio_driver resize_mask bar1_size
+    local port audio_driver resize_mask bar1_size dock_attached=0
+    local root_io_start root_io_end root_io_flags
     local upstream_secondary upstream_subordinate gpu_secondary
     local -a empty_ports=(
         "${bridge_prefix}:01.0"
@@ -199,8 +210,16 @@ repair_physical_hotplug_rebar() {
         return 1
     fi
     if [[ ${HP_DOCK_SUPPORT} == 1 ]] && hp_dock_router_present; then
-        echo "Refusing the first live ReBAR experiment while ${DOCK_DISPLAY_NAME} is attached." >&2
-        return 1
+        # Linux 7.2's replacement tunnel can preserve a complete cold-attached
+        # dock while shrinking RTX BAR1 to 256 MiB. Validate that exact tree,
+        # then keep its port untouched and release only the two empty siblings.
+        # The dry-run validates PCI identity and ancestry without removing it.
+        "${SCRIPT_DIR}/egpu-cold-hp-pci-rebuild.sh" --dry-run
+        dock_attached=1
+        empty_ports=(
+            "${bridge_prefix}:02.0"
+            "${bridge_prefix}:03.0"
+        )
     fi
 
     th5p4_router_present || return 1
@@ -252,13 +271,21 @@ repair_physical_hotplug_rebar() {
     bar1_size=$(pci_resource_size "${EXPECTED_GPU_BDF}" 1)
     if [[ ${bar1_size} == "${EGPU_BAR1_SIZE}" ]]; then
         echo "Found the complete 16 GiB RTX BAR1 from an interrupted guarded repair; validating it..."
-        EGPU_ALLOW_DYNAMIC_REBAR=1 "${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
         pci_repair_started=1
-        quarantine_dynamic_hp_pcie_hotplug
-        printf '%s\n' \
-            "TH5P4 late-hotplug dynamic ReBAR repair is active." \
-            "The kernel resized RTX BAR1 to 16 GiB before NVIDIA was allowed to bind." \
-            > "${LOCAL_RESERVE_MARKER}"
+        if ((dock_attached)); then
+            "${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
+            printf '%s\n' \
+                "TH5P4 cold-dock dynamic ReBAR repair is active." \
+                "The kernel resized RTX BAR1 to 16 GiB while preserving the validated HP PCI branch." \
+                > "${LOCAL_RESERVE_MARKER}"
+        else
+            EGPU_ALLOW_DYNAMIC_REBAR=1 "${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
+            quarantine_dynamic_hp_pcie_hotplug
+            printf '%s\n' \
+                "TH5P4 late-hotplug dynamic ReBAR repair is active." \
+                "The kernel resized RTX BAR1 to 16 GiB before NVIDIA was allowed to bind." \
+                > "${LOCAL_RESERVE_MARKER}"
+        fi
         rm -f -- "${REBOOT_MARKER}" /run/egpu-nvidia-hotplug-pending
         pci_repair_started=0
         echo "The previously completed Linux 7.2+ ReBAR transition passed strict recovery validation."
@@ -272,7 +299,18 @@ repair_physical_hotplug_rebar() {
     # A fresh 256 MiB late-hotplug state must still have the exact firmware
     # parent apertures. The kernel is allowed to relocate MMIO_PREF only as
     # part of the guarded resource1_resize operation below.
-    expect_bridge_window "${EXPECTED_USB4_ROOT_PORT_BDF}" 14 "${ROOT_IO_START}" "${ROOT_IO_END}" I/O
+    if ((dock_attached)); then
+        read -r root_io_start root_io_end root_io_flags < <(
+            sed -n '14p' "/sys/bus/pci/devices/${EXPECTED_USB4_ROOT_PORT_BDF}/resource"
+        )
+        ((root_io_flags != 0 && root_io_end >= root_io_start &&
+          root_io_end - root_io_start + 1 >= 32 * 1024)) || {
+            echo "Refusing cold-dock ReBAR repair: the reassigned USB4 root I/O aperture is smaller than 32 KiB." >&2
+            return 1
+        }
+    else
+        expect_bridge_window "${EXPECTED_USB4_ROOT_PORT_BDF}" 14 "${ROOT_IO_START}" "${ROOT_IO_END}" I/O
+    fi
     expect_bridge_window "${EXPECTED_USB4_ROOT_PORT_BDF}" 15 "${ROOT_MMIO_START}" "${ROOT_MMIO_END}" MMIO
     expect_bridge_window "${EXPECTED_USB4_ROOT_PORT_BDF}" 16 "${ROOT_PREF_START}" "${ROOT_PREF_END}" MMIO_PREF
 
@@ -289,7 +327,11 @@ repair_physical_hotplug_rebar() {
     fi
 
     pci_repair_started=1
-    echo "Releasing the three validated empty ${ENCLOSURE_DISPLAY_NAME} ports..."
+    if ((dock_attached)); then
+        echo "Preserving the validated live ${DOCK_DISPLAY_NAME} branch and releasing only two empty ${ENCLOSURE_DISPLAY_NAME} sibling ports..."
+    else
+        echo "Releasing the three validated empty ${ENCLOSURE_DISPLAY_NAME} ports..."
+    fi
     for port in "${empty_ports[@]}"; do
         echo 1 > "/sys/bus/pci/devices/${port}/remove"
     done
@@ -328,15 +370,27 @@ repair_physical_hotplug_rebar() {
 
     resolve_egpu_topology
     validate_expected_topology
-    EGPU_ALLOW_DYNAMIC_REBAR=1 "${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
-    quarantine_dynamic_hp_pcie_hotplug
-    printf '%s\n' \
-        "TH5P4 late-hotplug dynamic ReBAR repair is active." \
-        "The kernel resized RTX BAR1 to 16 GiB before NVIDIA was allowed to bind." \
-        > "${LOCAL_RESERVE_MARKER}"
+    if ((dock_attached)); then
+        "${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
+        printf '%s\n' \
+            "TH5P4 cold-dock dynamic ReBAR repair is active." \
+            "The kernel resized RTX BAR1 to 16 GiB while preserving the validated HP PCI branch." \
+            > "${LOCAL_RESERVE_MARKER}"
+    else
+        EGPU_ALLOW_DYNAMIC_REBAR=1 "${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
+        quarantine_dynamic_hp_pcie_hotplug
+        printf '%s\n' \
+            "TH5P4 late-hotplug dynamic ReBAR repair is active." \
+            "The kernel resized RTX BAR1 to 16 GiB before NVIDIA was allowed to bind." \
+            > "${LOCAL_RESERVE_MARKER}"
+    fi
     rm -f -- "${REBOOT_MARKER}" /run/egpu-nvidia-hotplug-pending
     pci_repair_started=0
-    echo "The guarded Linux 7.2+ physical hot-plug ReBAR repair passed."
+    if ((dock_attached)); then
+        echo "The guarded Linux 7.2+ cold-dock ReBAR repair passed without removing the HP PCI branch."
+    else
+        echo "The guarded Linux 7.2+ physical hot-plug ReBAR repair passed."
+    fi
 }
 
 repair_hotplug_size_reattach() {

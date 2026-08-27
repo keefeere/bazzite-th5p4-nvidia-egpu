@@ -65,6 +65,25 @@ egpu_kernel_compat_mode() {
     fi
 }
 
+egpu_boot_order_dropin() {
+    local mode=$1
+
+    case ${mode} in
+        hotplug-size)
+            printf '%s\n' \
+                '[Unit]' \
+                'Wants=bolt.service' \
+                'After=bolt.service'
+            ;;
+        legacy)
+            printf '%s\n' \
+                '[Unit]' \
+                'Before=bolt.service'
+            ;;
+        *) return 2 ;;
+    esac
+}
+
 # The original 6.17 deployment needed host_reset=0 for stable cold-attached
 # operation. On the tested 7.2 AMD USB4 stack it prevents a freshly booted
 # host router from bringing a first hot-plugged TH5P4 to TB_PORT_UP. Keep the

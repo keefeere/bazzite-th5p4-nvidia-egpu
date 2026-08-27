@@ -18,9 +18,10 @@ ASUS ROG Xbox Ally X
 ```
 
 The stack preserves firmware PCI numbering, reserves buses and bridge windows
-only below the configured eGPU enclosure, rebuilds a known cold-attached dock's
-PCI subtree without deauthorizing its USB4 router, initializes NVIDIA before
-KWin, and provides a safe-detach Plasma widget.
+only below the configured eGPU enclosure, handles a known cold-attached dock
+through a kernel-version-specific guarded path without deauthorizing its USB4
+router, initializes NVIDIA before KWin, and provides a safe-detach Plasma
+widget.
 
 ## Safety boundary
 
@@ -64,6 +65,19 @@ containment and non-overlap before NVIDIA can load. If the selected kernel
 argument is absent or the rejected realloc argument is active, the service
 fails closed.
 
+Once the exact TH5P4 router is visible, the bundled profile allows up to 12
+seconds for its RTX endpoint. A cold-attached downstream HP Dock was measured
+to push enumeration to the former 5-second boundary. This bounded wait is not
+used when TH5P4 is absent, so it does not slow an ordinary AMD-only boot. An
+adapted profile may set `EGPU_ENDPOINT_WAIT_SECONDS` from 1 through 30.
+
+Boot ordering is also selected by kernel generation. The validated legacy path
+keeps eGPU staging before `bolt.service`. On Linux 7.2 and newer the upstream
+USB4 host reset can replace the initramfs PCIe tunnel, so `boltd` is started
+first to authorize the replacement tunnel; the bounded endpoint wait then
+runs before Cardwire and the display manager. This avoids an ordering deadlock
+without changing the older-kernel path.
+
 The installer records ownership only when it adds the exact
 32 MiB sizing argument itself. A rerun after booting an older kernel removes
 that project-owned argument and restores the legacy behavior. The installer
@@ -71,6 +85,17 @@ also migrates away the exact `pci=realloc=on` argument owned by the rejected
 earlier compatibility attempt. Pre-existing user-owned arguments are never
 silently deleted. After a major kernel update, rerun the installer and reboot
 before judging eGPU output.
+
+The controlled loader uses an isolated modprobe configuration so Bazzite cannot
+auto-load `nvidia_drm` before PCI staging completes. Before loading the NVIDIA
+core module it now inspects the active deployment's normal modprobe policy. If
+that deployment requests
+`NVreg_RegistryDwords=RMDisableNoncontigAlloc=1`, the loader mirrors the exact
+option for that load. This preserves Bazzite's contiguous-allocation workaround
+for Gamescope scanout corruption without hard-coding a new-driver policy into
+older deployments. The verifier checks both the host request and the live
+`RegistryDwords` value; changing this policy requires a reboot before the live
+check can pass.
 
 ## Install the bundled profile
 
@@ -123,8 +148,8 @@ the local-reserve preflight with NVIDIA unloaded. The project intentionally
 does not infer or program novel resource layouts automatically.
 
 Set `HP_DOCK_SUPPORT=0` when there is no validated downstream PCIe dock. Dock
-tree checks and the cold-attached rebuild are then disabled while the eGPU path
-remains available.
+tree checks and the cold-attached compatibility path are then disabled while
+the eGPU path remains available.
 
 ## Tray language and safe unplug
 
@@ -160,27 +185,33 @@ child-only rescan.
 
 Physically unplugging the enclosure invalidates the runtime bridge reservation.
 On this validated machine, a same-boot cable replug enumerates the RTX with a
-256 MiB BAR1 instead of 16 GiB. The exact TH5P4 remove event therefore clears
-stale runtime state, and the automatic add event keeps the reappearing GPU
-driverless so the AMD session is not disrupted.
+256 MiB BAR1 instead of 16 GiB. Safe detach is therefore a supported one-way
+operation: after the widget permits unplugging, cable removal is successful,
+but the next NVIDIA use requires a reboot with the enclosure attached. The
+tray reports this as **eGPU safely disconnected**, not as a PCI failure. If the
+cable is reinserted in that boot, NVIDIA stays blocked and the tray asks for a
+reboot. While the cable has never been removed, the existing **Connect eGPU**
+action may still reverse a same-cable detach through its separately validated
+RTX-port rescan.
 
-On Linux 7.2+, an explicit **Connect eGPU** action can repair the exact bundled
-profile without rebooting. It requires the HP Dock to be absent, validates the
-driver-free 256 MiB input state and every sibling bridge, ends the graphical
-session, removes only the three empty TH5P4 ports, and requests a 16 GiB BAR1
-through the kernel's `resource1_resize` interface. The relocated parent and GPU
-windows, endpoint BARs, bus ranges, containment and non-overlap must all pass
-before NVIDIA is allowed to bind. An interrupted operation can resume only
-after the already-resized layout passes the same verifier.
+A fresh physical hot-plug after an AMD-only graphical boot is not a supported
+production flow on Linux 7.2. The automatic add event deliberately leaves the
+endpoint driverless and asks for a reboot rather than ending the current
+session or mutating live PCI resources. `egpu-nvidia-hot-attach.service`
+retains a guarded diagnostic ReBAR experiment for development: it validates
+the exact driver-free 256 MiB input state, can preserve the configured HP Dock
+branch, ends the graphical session and requests a 16 GiB BAR1 through the
+kernel's `resource1_resize` interface. It is not exposed by the tray after a
+physical hot-plug and is not part of the supported lifecycle contract.
 
-The 7.2 allocator leaves only 4 KiB of I/O on each empty downstream port in
-this dynamic layout, less than the complete HP Dock PCI tree was validated
-with. The repair therefore unbinds `pciehp` only from the exact HP-facing port
-until reboot. NVIDIA outputs and enclosure USB remain available, but HP Dock
-PCIe/Ethernet hot-add is deliberately disabled for that boot. Reboot with the
-dock attached for full dock function and the normal early Gen4 path. The live
-repair uses conservative Gen3. Older kernels and any topology outside the
-strict profile continue to require a reboot rather than attempting ReBAR.
+When the diagnostic repair runs without the HP Dock, the 7.2 allocator leaves
+only 4 KiB of I/O on each empty downstream port, less than the complete HP Dock
+PCI tree was validated with. The repair therefore unbinds `pciehp` only from
+the exact HP-facing port until reboot. NVIDIA outputs and enclosure USB remain
+available, but HP Dock PCIe/Ethernet hot-add is deliberately disabled for that
+experimental boot. The live repair uses conservative Gen3. Older kernels and
+any topology outside the strict profile require a reboot rather than
+attempting ReBAR.
 
 The profile also loads `nvidia_drm` with `fbdev=0`. The integrated GPU remains
 the fallback VT/framebuffer device; otherwise NVIDIA's kernel framebuffer can
@@ -218,7 +249,13 @@ sudo /etc/egpu-nvidia/disable-egpu-gen4.sh
 
 - warm host reboot with the complete chain left powered and connected;
 - host-only shutdown/power-on while enclosure and dock remain powered;
-- downstream dock hot-add after the verified local reserve is active.
+- full cold boot with the complete enclosure and dock chain already attached;
+- safe release and physical unplug, with a reboot required before reuse;
+- same-cable detach and reattach without physically removing the USB4 cable.
+
+Fresh physical eGPU hot-attach, same-boot replug after cable removal and
+hot-adding the complete downstream PCIe dock are outside the supported
+production lifecycle. Boot with the required chain already connected.
 
 A rare full-chain power-cycle can leave only the configured enclosure's USB
 diagnostic function visible while its USB4/PCIe router and GPU never enumerate.

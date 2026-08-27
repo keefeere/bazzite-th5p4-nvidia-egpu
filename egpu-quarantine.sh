@@ -14,12 +14,28 @@ LATE_MARKER="/run/egpu-nvidia-late-loaded"
 KWIN_ENV="/etc/environment.d/10kwin-egpu.conf"
 DETACH_BLOCK_MARKER="/run/egpu-nvidia-detach-block"
 LOCAL_RESERVE_FAILURE_MARKER="/run/egpu-local-reserve-failed"
+RELEASED_UNPLUGGED_MARKER="/run/egpu-nvidia-released-unplugged"
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
 
 exec 9>"${LOCK_FILE}"
 flock -x 9
+
+# A cable removed after a successful safe detach is a completed one-way
+# transition on this Linux 7.2 profile. Never reinterpret its later add event
+# as a repairable first hot-plug: the released bridge state belongs to the
+# previous tunnel and must be rebuilt during the next early boot.
+if [[ -s ${RELEASED_UNPLUGGED_MARKER} ]]; then
+    install -D -m 0644 /dev/null /run/egpu-nvidia-reboot-required
+    printf '%s\n' \
+        "The eGPU was safely unplugged earlier in this boot." \
+        "Same-boot physical reattach is unsupported; reboot with the enclosure attached." \
+        > "${PENDING_MARKER}"
+    rm -f -- "${LATE_MARKER}"
+    cat "${PENDING_MARKER}"
+    exit 0
+fi
 
 if [[ -e ${DETACH_BLOCK_MARKER} ]]; then
     echo "Safe-detach is latched; refusing automatic NVIDIA reload until a deliberate hot-attach or reboot."
@@ -43,11 +59,10 @@ if grep -q '^nvidia_drm ' /proc/modules; then
     exit 0
 fi
 
-# A physical enclosure unplug invalidates the live TH5P4 bridge programming.
-# The kernel may enumerate the RTX again with only a small BAR1. Rebuilding the
-# local reserve requires a deliberate graphical-session transition, so never
-# perform it from an automatic udev event. Leave a non-error pending state for
-# the tray's explicit Connect eGPU action.
+# A physical enclosure hot-plug can enumerate the RTX with only a small BAR1.
+# Rebuilding the local reserve requires a deliberately experimental graphical
+# transition, so never perform it from an automatic udev event or advertise it
+# as the normal tray flow. The production recovery is an early boot.
 reserve_needs_manual_rebuild=0
 if [[ -e /etc/egpu-nvidia/enable-local-reserve ]]; then
     if [[ ! -s /run/egpu-local-reserve-applied ]]; then
@@ -68,8 +83,8 @@ if (( reserve_needs_manual_rebuild )); then
         } > "${PENDING_MARKER}"
     else
         printf '%s\n' \
-            "The physically reconnected NVIDIA eGPU needs a reboot to restore its validated PCI resources." \
-            "The current AMD session remains untouched; NVIDIA will not be loaded in this boot." \
+            "The NVIDIA eGPU appeared after the graphical boot path." \
+            "Production activation requires a reboot with the enclosure attached; the current AMD session remains untouched." \
             > "${PENDING_MARKER}"
     fi
     rm -f -- "${LATE_MARKER}"

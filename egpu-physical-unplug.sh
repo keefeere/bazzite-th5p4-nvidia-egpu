@@ -14,6 +14,10 @@ if [[ -s /run/egpu-safe-to-unplug && -e /run/egpu-nvidia-detach-block ]]; then
         /run/egpu-pciehp-quarantined \
         /run/egpu-local-reserve-before.txt \
         /run/egpu-gen4-test-active
+    printf '%s\n' \
+        "The eGPU cable was removed after a successful safe detach." \
+        "Same-boot physical reattach is unsupported; reboot with the enclosure attached." \
+        > /run/egpu-nvidia-released-unplugged
     install -D -m 0644 /dev/null /run/egpu-nvidia-reboot-required
-    logger -t egpu-nvidia "The safely released TH5P4 was physically unplugged; a reboot is required before NVIDIA can be used again."
+    logger -t egpu-nvidia "Safe detach completed and TH5P4 was physically unplugged; same-boot reattach is unsupported, so the next NVIDIA use requires a reboot."
 fi

@@ -263,6 +263,7 @@ fi
 echo "  - guarded persistent PCIe Gen4 x4: armed"
 echo "  - NVIDIA-first KWin order and safe-detach widget: installed"
 echo "  - automatic NVIDIA loading and ublue-nvctk-cdi: blocked"
+echo "  - active Bazzite NVIDIA module policy: mirrored by the controlled loader"
 echo "  - kernel PCI compatibility mode: ${kernel_compat_mode}"
 if [[ ${kernel_compat_mode} == hotplug-size ]]; then
     echo "  - USB4 host-router reset policy: upstream default (first hot-plug tested)"

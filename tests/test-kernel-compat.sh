@@ -46,6 +46,14 @@ expect_equal hotplug-size "$(egpu_kernel_compat_mode 7.2.0-ogc6.1.fc44.x86_64)" 
 expect_equal hotplug-size "$(egpu_kernel_compat_mode 8.0.0-test)" \
     "future kernel remains on guarded hot-plug sizing mode"
 
+expect_equal $'[Unit]\nBefore=bolt.service' "$(egpu_boot_order_dropin legacy)" \
+    "old kernel keeps eGPU staging before boltd"
+expect_equal $'[Unit]\nWants=bolt.service\nAfter=bolt.service' \
+    "$(egpu_boot_order_dropin hotplug-size)" \
+    "new kernel authorizes the replacement USB4 tunnel before eGPU staging"
+expect_failure "unknown boot-order mode is rejected" \
+    egpu_boot_order_dropin unsupported
+
 expect_equal add "$(egpu_managed_host_reset_action 6.17.7 'quiet splash')" \
     "old kernel adds its validated host-reset workaround"
 expect_equal keep "$(egpu_managed_host_reset_action 6.17.7 'quiet thunderbolt.host_reset=0')" \

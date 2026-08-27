@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOAD_SCRIPT="${SCRIPT_DIR}/egpu-load-nvidia-gen3.sh"
 LOCAL_RESERVE_SCRIPT="${SCRIPT_DIR}/egpu-local-reserve-apply.sh"
 LOCAL_COLD_HP_REBUILD="${SCRIPT_DIR}/egpu-cold-hp-pci-rebuild.sh"
+LOCAL_COLD_HP_DYNAMIC_REBAR="${SCRIPT_DIR}/egpu-cold-hp-dynamic-rebar.sh"
 LOCAL_RESERVE_VERIFY="${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
 LOCAL_COLD_DOCK_VERIFY="${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
 LOCAL_RESERVE_ENABLE="/etc/egpu-nvidia/enable-local-reserve"
@@ -22,13 +23,23 @@ KWIN_ENV="/etc/environment.d/10kwin-egpu.conf"
 TEST_ENV="/etc/environment.d/10kwin-egpu-test.conf"
 LOCK_FILE="/run/egpu-nvidia-transition.lock"
 PENDING_MARKER="/run/egpu-nvidia-hotplug-pending"
-ENDPOINT_WAIT_SECONDS=5
-ENDPOINT_WAIT_STEPS=$((ENDPOINT_WAIT_SECONDS * 5))
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
 # shellcheck source=egpu-kernel-compat.sh
 source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
+
+# A cold-attached downstream dock delayed the exact RTX endpoint until the
+# same timestamp at which the former 5-second guard expired. This wait is used
+# only after the configured TH5P4 router is already present, so it does not
+# delay an ordinary AMD-only boot. Profiles may select a reviewed 1..30 value.
+ENDPOINT_WAIT_SECONDS=${EGPU_ENDPOINT_WAIT_SECONDS:-12}
+[[ ${ENDPOINT_WAIT_SECONDS} =~ ^[1-9][0-9]*$ ]] &&
+    ((ENDPOINT_WAIT_SECONDS <= 30)) || {
+        echo "Invalid EGPU_ENDPOINT_WAIT_SECONDS=${ENDPOINT_WAIT_SECONDS}; expected 1..30." >&2
+        exit 1
+    }
+ENDPOINT_WAIT_STEPS=$((ENDPOINT_WAIT_SECONDS * 5))
 
 refresh_gpu_bdf() {
     GPU="$(find_unique_pci_device "${EGPU_VENDOR}" "${EGPU_DEVICE}" 2>/dev/null || true)"
@@ -119,7 +130,7 @@ fi
 
 if ! refresh_gpu_bdf; then
     echo "${ENCLOSURE_DISPLAY_NAME} stayed present but its ${EGPU_DISPLAY_NAME} endpoint did not appear within ${ENDPOINT_WAIT_SECONDS} seconds." >&2
-    echo "Leaving KWin on ${IGPU_DISPLAY_NAME}; a later endpoint will be quarantined at Gen3 for manual hot-attach." >&2
+    echo "Leaving KWin on ${IGPU_DISPLAY_NAME}; a later endpoint will remain driverless until a cold boot with the enclosure attached." >&2
     exit 0
 fi
 
@@ -172,7 +183,13 @@ if [[ -e ${LOCAL_RESERVE_ENABLE} ]]; then
         done
         if hp_dock_router_present; then
             if hp_pci_subtree_present; then
-                run_local_reserve_step "cold-attached dock PCI rebuild" "${LOCAL_COLD_HP_REBUILD}"
+                if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+                    run_local_reserve_step \
+                        "cold-attached dock dynamic ReBAR repair" \
+                        env EGPU_DYNAMIC_REBAR_BOOT_CONTEXT=1 "${LOCAL_COLD_HP_DYNAMIC_REBAR}"
+                else
+                    run_local_reserve_step "cold-attached dock PCI rebuild" "${LOCAL_COLD_HP_REBUILD}"
+                fi
             else
                 hp_router="$(find_hp_dock_router_dir)"
                 if [[ $(cat -- "${hp_router}/authorized" 2>/dev/null || true) == 1 ]]; then

@@ -9,6 +9,8 @@ warnings=0
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
 # shellcheck source=egpu-kernel-compat.sh
 source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
+# shellcheck source=egpu-nvidia-policy.sh
+source "${SCRIPT_DIR}/egpu-nvidia-policy.sh"
 
 pass() {
     printf 'PASS  %s\n' "$1"
@@ -120,6 +122,7 @@ fi
 check_file /etc/egpu-nvidia/enable-local-reserve "local ${ENCLOSURE_DISPLAY_NAME} reservation enabled"
 check_file /etc/egpu-nvidia/hardware.conf "versioned hardware profile installed"
 check_file /etc/egpu-nvidia/egpu-cardwire-compat.sh "Cardwire transition compatibility installed"
+check_file /etc/egpu-nvidia/egpu-nvidia-policy.sh "host NVIDIA policy compatibility installed"
 check_file /etc/egpu-nvidia/use-gen4 "persistent Gen4 preference enabled"
 check_file /etc/modprobe.d/99-egpu-delay-nvidia.conf "automatic NVIDIA module loading blocked"
 check_file /etc/dracut.conf.d/zz-egpu-delay.conf "NVIDIA omitted from locally generated initramfs"
@@ -147,8 +150,24 @@ else
     fail "egpu-nvidia-boot.service is not enabled"
 fi
 
+boot_after=" $(systemctl show egpu-nvidia-boot.service -p After --value 2>/dev/null || true) "
+boot_before=" $(systemctl show egpu-nvidia-boot.service -p Before --value 2>/dev/null || true) "
+if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+    if [[ ${boot_after} == *" bolt.service "* &&
+          ${boot_before} != *" bolt.service "* ]]; then
+        pass "Linux 7.2+ early service waits for boltd USB4 authorization"
+    else
+        fail "Linux 7.2+ boot ordering can deadlock RTX enumeration behind bolt.service"
+    fi
+elif [[ ${kernel_compat_mode} == legacy ]]; then
+    if [[ ${boot_before} == *" bolt.service " ]]; then
+        pass "legacy kernel retains the validated pre-boltd eGPU order"
+    else
+        fail "legacy kernel lost its validated pre-boltd eGPU order"
+    fi
+fi
+
 if systemctl cat cardwired.service >/dev/null 2>&1; then
-    boot_before=" $(systemctl show egpu-nvidia-boot.service -p Before --value 2>/dev/null || true) "
     if [[ ${boot_before} == *" cardwired.service "* ]]; then
         pass "early eGPU boot service is ordered before Cardwire"
     else
@@ -188,6 +207,19 @@ if resolve_egpu_topology 2>/dev/null; then
             fail "kernel module ${module} is not loaded"
         fi
     done
+
+    if egpu_nvidia_host_has_contiguous_policy; then
+        pass "active Bazzite profile requests contiguous NVIDIA scanout allocations"
+        if grep -q '^nvidia ' /proc/modules; then
+            if egpu_nvidia_live_has_contiguous_policy; then
+                pass "controlled NVIDIA loader applied RMDisableNoncontigAlloc=1"
+            else
+                fail "loaded NVIDIA module missed RMDisableNoncontigAlloc=1; reinstall the stack and reboot"
+            fi
+        fi
+    else
+        pass "active host profile does not request the optional NVIDIA contiguous-allocation policy"
+    fi
 
     if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
         pass "NVIDIA userspace can talk to the RTX"

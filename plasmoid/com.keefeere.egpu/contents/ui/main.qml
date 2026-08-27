@@ -33,10 +33,11 @@ PlasmoidItem {
     readonly property bool canAttach: egpuState === "safe" || egpuState === "reattach" || egpuState === "present"
     readonly property bool isBusy: egpuState === "detaching" || egpuState === "attaching" || egpuState === "initializing"
 
-    Plasmoid.icon: egpuState === "safe" ? "media-eject" :
+    Plasmoid.icon: (egpuState === "safe" || egpuState === "unplugged") ? "media-eject" :
         egpuState === "error" ? "data-error" :
         (egpuState === "stuck" || egpuState === "reboot") ? "dialog-warning" : "video-display"
-    Plasmoid.status: egpuState === "absent" ? PlasmaCore.Types.PassiveStatus : PlasmaCore.Types.ActiveStatus
+    Plasmoid.status: (egpuState === "absent" || egpuState === "unplugged")
+        ? PlasmaCore.Types.PassiveStatus : PlasmaCore.Types.ActiveStatus
     Plasmoid.busy: isBusy
 
     toolTipMainText: stateTitle

@@ -118,6 +118,13 @@ validate_egpu_config() {
         egpu_config_die "NVIDIA_DRM_FBDEV must be 0 or 1"
         return 1
     }
+    if [[ -v EGPU_ENDPOINT_WAIT_SECONDS ]]; then
+        [[ ${EGPU_ENDPOINT_WAIT_SECONDS} =~ ^[1-9][0-9]*$ ]] &&
+            ((EGPU_ENDPOINT_WAIT_SECONDS <= 30)) || {
+                egpu_config_die "EGPU_ENDPOINT_WAIT_SECONDS must be between 1 and 30"
+                return 1
+            }
+    fi
 
     for variable in EGPU_VENDOR EGPU_DEVICE EGPU_AUDIO_VENDOR EGPU_AUDIO_DEVICE \
                     IGPU_VENDOR IGPU_DEVICE TH5P4_VENDOR TH5P4_DEVICE \

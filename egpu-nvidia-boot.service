@@ -2,7 +2,7 @@
 Description=Stage the NVIDIA eGPU before the graphical session
 Documentation=https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1229
 After=local-fs.target systemd-udev-trigger.service
-Before=bolt.service cardwired.service display-manager.service
+Before=cardwired.service display-manager.service
 
 [Service]
 Type=oneshot

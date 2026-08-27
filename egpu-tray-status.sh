@@ -9,6 +9,8 @@ ATTACH_SERVICE="egpu-nvidia-hot-attach.service"
 REBOOT_MARKER="/run/egpu-nvidia-reboot-required"
 LOCAL_RESERVE_FAILURE_MARKER="/run/egpu-local-reserve-failed"
 PCIEHP_QUARANTINE_MARKER="/run/egpu-pciehp-quarantined"
+PENDING_MARKER="/run/egpu-nvidia-hotplug-pending"
+RELEASED_UNPLUGGED_MARKER="/run/egpu-nvidia-released-unplugged"
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
@@ -54,6 +56,20 @@ if systemctl is-active --quiet "${DETACH_SERVICE}"; then
         "$(tr "Ending the graphical session and releasing NVIDIA." "Завершуємо графічний сеанс і звільняємо NVIDIA.")"
 fi
 
+# Safe detach has already done its job before the physical remove event. On
+# this profile cable removal is intentionally one-way until reboot; present it
+# as a completed lifecycle state rather than a failed PCI repair.
+if [[ -s ${RELEASED_UNPLUGGED_MARKER} ]]; then
+    if th5p4_router_present || resolve_egpu_gpu; then
+        emit unplugged \
+            "$(tr "eGPU reconnected — reboot required" "eGPU підключена знову — потрібен reboot")" \
+            "$(tr "This boot already completed a safe physical detach. Reboot with the enclosure attached to rebuild its PCI resources." "У цьому boot уже виконано безпечне фізичне від’єднання. Перезавантаж систему з підключеним корпусом, щоб заново побудувати PCI-ресурси.")"
+    fi
+    emit unplugged \
+        "$(tr "eGPU safely disconnected" "eGPU безпечно від’єднана")" \
+        "$(tr "The detach completed successfully. Reboot with the enclosure attached when you want to use NVIDIA again." "Від’єднання завершилось успішно. Щоб знову використовувати NVIDIA, перезавантаж систему з підключеним корпусом.")"
+fi
+
 if systemctl is-failed --quiet "${DETACH_SERVICE}"; then
     emit error \
         "$(tr "Detach failed" "Помилка від’єднання")" \
@@ -86,6 +102,12 @@ if [[ -s ${LOCAL_RESERVE_FAILURE_MARKER} ]]; then
     emit error \
         "$(tr "PCI reserve failed" "Помилка резервування PCI")" \
         "$(tr "NVIDIA stayed blocked. Check egpu-nvidia-boot.service, correct the kernel compatibility state, then reboot." "NVIDIA лишилася заблокованою. Перевір egpu-nvidia-boot.service, виправ стан сумісності ядра та перезавантаж систему.")"
+fi
+
+if [[ -s ${PENDING_MARKER} && -e ${REBOOT_MARKER} ]]; then
+    emit reboot \
+        "$(tr "Cold boot required" "Потрібен cold boot")" \
+        "$(tr "The eGPU appeared after graphical startup. Full physical hot-attach is not a supported production flow; reboot with the complete chain attached." "eGPU з’явилася після запуску графічного сеансу. Повний physical hot-attach не є підтримуваним production-сценарієм; перезавантаж систему з підключеним повним ланцюгом.")"
 fi
 
 if [[ -e ${REBOOT_MARKER} ]] ||
@@ -142,6 +164,6 @@ if grep -q '^nvidia ' /proc/modules; then
         "$(tr "The PCIe device is present; waiting for DRM/KWin." "PCIe-пристрій присутній, очікуємо DRM/KWin.")"
 fi
 
-emit present \
+emit detected \
     "$(tr "${EGPU_DISPLAY_NAME} detected" "${EGPU_DISPLAY_NAME} знайдена")" \
-    "$(tr "The NVIDIA driver is not loaded yet." "Драйвер NVIDIA ще не завантажений.")"
+    "$(tr "The NVIDIA driver is not loaded. Use the cold-boot flow unless this is a same-cable reattach offered above." "Драйвер NVIDIA не завантажений. Використовуй cold-boot flow, крім окремо запропонованого вище same-cable reattach.")"

@@ -12,6 +12,8 @@ SERVICE="egpu-nvidia-boot.service"
 KWIN_ENV="/etc/environment.d/10kwin-egpu.conf"
 POLKIT_RULE="/etc/polkit-1/rules.d/49-egpu-nvidia.rules"
 PLASMOID_ID="com.keefeere.egpu"
+BOOT_ORDER_DIR="/etc/systemd/system/${SERVICE}.d"
+BOOT_ORDER_DROPIN="${BOOT_ORDER_DIR}/20-kernel-compat-order.conf"
 
 profile_source="${EGPU_PROFILE_SOURCE:-}"
 if [[ -n ${profile_source} ]]; then
@@ -32,6 +34,12 @@ EGPU_CONFIG_FILE="${profile_source}" "${SOURCE_DIR}/egpu-config-preflight.sh"
 EGPU_CONFIG_FILE="${profile_source}"
 # shellcheck source=egpu-pci-lib.sh
 source "${SOURCE_DIR}/egpu-pci-lib.sh"
+# shellcheck source=egpu-kernel-compat.sh
+source "${SOURCE_DIR}/egpu-kernel-compat.sh"
+kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)") || {
+    echo "Unsupported kernel release: $(uname -r)" >&2
+    exit 1
+}
 install -d -m 0755 "${INSTALL_DIR}"
 if [[ ${profile_source} != "${INSTALL_DIR}/hardware.conf" ]]; then
     install -m 0644 "${profile_source}" "${INSTALL_DIR}/hardware.conf"
@@ -70,6 +78,7 @@ install -m 0755 \
     "${SOURCE_DIR}/egpu-local-reserve-preflight.sh" \
     "${SOURCE_DIR}/egpu-local-reserve-apply.sh" \
     "${SOURCE_DIR}/egpu-cold-hp-pci-rebuild.sh" \
+    "${SOURCE_DIR}/egpu-cold-hp-dynamic-rebar.sh" \
     "${SOURCE_DIR}/egpu-local-reserve-verify.sh" \
     "${SOURCE_DIR}/egpu-cold-attached-hp-verify.sh" \
     "${SOURCE_DIR}/egpu-local-reserve-accept-live.sh" \
@@ -77,6 +86,7 @@ install -m 0755 \
 install -m 0644 \
     "${SOURCE_DIR}/egpu-pci-lib.sh" \
     "${SOURCE_DIR}/egpu-kernel-compat.sh" \
+    "${SOURCE_DIR}/egpu-nvidia-policy.sh" \
     "${SOURCE_DIR}/nvidia-base-only.conf" \
     "${INSTALL_DIR}/"
 install -m 0644 \
@@ -85,6 +95,14 @@ install -m 0644 \
     "${SOURCE_DIR}/egpu-nvidia-detach.service" \
     "${SOURCE_DIR}/egpu-nvidia-hot-attach.service" \
     "/etc/systemd/system/"
+
+# Linux 7.2+ uses the upstream host reset. During cold boot it can disconnect
+# the initramfs PCI tunnel, so boltd must authorize the replacement tunnel
+# before this service waits for and rebuilds RTX. Preserve the original
+# pre-boltd order byte-for-byte on the legacy kernel path.
+install -d -m 0755 "${BOOT_ORDER_DIR}"
+egpu_boot_order_dropin "${kernel_compat_mode}" > "${BOOT_ORDER_DROPIN}"
+chmod 0644 "${BOOT_ORDER_DROPIN}"
 install -D -m 0644 \
     "${SOURCE_DIR}/99-egpu-delay-nvidia.conf" \
     "/etc/modprobe.d/99-egpu-delay-nvidia.conf"

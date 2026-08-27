@@ -24,6 +24,7 @@ fi
 
 systemctl disable --now egpu-nvidia-boot.service 2>/dev/null || true
 systemctl unmask ublue-nvctk-cdi.service 2>/dev/null || true
+rm -rf -- /etc/systemd/system/egpu-nvidia-boot.service.d
 
 rm -f -- \
     /etc/systemd/system/egpu-nvidia-boot.service \
