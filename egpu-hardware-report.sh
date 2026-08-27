@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=egpu-kernel-compat.sh
+source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
+kernel_release=$(uname -r)
+kernel_compat_mode=$(egpu_kernel_compat_mode "${kernel_release}" 2>/dev/null || echo unknown)
+
 printf '%s\n' \
     "eGPU hardware discovery report" \
     "Generated: $(date --iso-8601=seconds)" \
     "Host: $(hostname)" \
-    "Kernel: $(uname -r)" \
+    "Kernel: ${kernel_release}" \
+    "Kernel PCI compatibility mode: ${kernel_compat_mode}" \
+    "Kernel command line: $(</proc/cmdline)" \
     "User: $(id -un):$(id -u)" \
     ""
 

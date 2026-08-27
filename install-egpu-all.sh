@@ -3,6 +3,10 @@ set -Eeuo pipefail
 
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/etc/egpu-nvidia"
+PCI_REALLOC_OWNER_MARKER="${INSTALL_DIR}/managed-pci-realloc"
+
+# shellcheck source=egpu-kernel-compat.sh
+source "${SOURCE_DIR}/egpu-kernel-compat.sh"
 
 profile_source=""
 case ${1:-} in
@@ -99,19 +103,55 @@ install -D -m 0644 "${SOURCE_DIR}/zz-egpu-delay.conf" "/etc/dracut.conf.d/zz-egp
 install -D -m 0644 "${SOURCE_DIR}/99-egpu-delay-nvidia.conf" "/etc/modprobe.d/99-egpu-delay-nvidia.conf"
 
 # These two arguments prevent controller resets/low-power transitions that
-# were correlated with the original USB4/eGPU instability.  Avoid creating a
-# redundant deployment when both are already present.
+# were correlated with the original USB4/eGPU instability. Linux 7.2+ also
+# needs its standard PCI realloc pass enabled so the controlled TH5P4 rescan
+# retains the locally programmed bridge windows. Older kernels deliberately
+# keep the previously validated no-realloc path.
+kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)") || {
+    echo "Unsupported kernel release format: $(uname -r)" >&2
+    exit 1
+}
 current_kargs=" $(rpm-ostree kargs) "
 kargs_command=(rpm-ostree kargs)
+manage_pci_realloc=""
 for arg in thunderbolt.host_reset=0 thunderbolt.clx=0; do
     if [[ ${current_kargs} != *" ${arg} "* ]]; then
         kargs_command+=("--append-if-missing=${arg}")
     fi
 done
+managed_pci_realloc=0
+[[ -e ${PCI_REALLOC_OWNER_MARKER} ]] && managed_pci_realloc=1
+case $(egpu_managed_pci_realloc_action "$(uname -r)" "${current_kargs}" "${managed_pci_realloc}") in
+    add)
+        kargs_command+=("--append-if-missing=${EGPU_PCI_REALLOC_KARG}")
+        manage_pci_realloc=add
+        ;;
+    remove)
+        kargs_command+=("--delete-if-present=${EGPU_PCI_REALLOC_KARG}")
+        manage_pci_realloc=remove
+        ;;
+    keep) ;;
+    *) echo "Could not select a kernel PCI compatibility action." >&2; exit 1 ;;
+esac
 if ((${#kargs_command[@]} > 2)); then
     "${kargs_command[@]}"
 else
-    echo "The tested Thunderbolt kernel arguments are already staged."
+    echo "The tested kernel arguments are already staged for ${kernel_compat_mode} PCI compatibility mode."
+fi
+if [[ ${manage_pci_realloc} == add ]]; then
+    install -D -m 0644 /dev/null "${PCI_REALLOC_OWNER_MARKER}"
+    echo "Staged ${EGPU_PCI_REALLOC_KARG} for Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+; this stack owns the exact argument."
+elif [[ ${manage_pci_realloc} == remove ]]; then
+    rm -f -- "${PCI_REALLOC_OWNER_MARKER}"
+    echo "Removed the stack-managed ${EGPU_PCI_REALLOC_KARG}; the pre-${EGPU_PCI_REALLOC_MIN_KERNEL} flow remains unchanged."
+elif [[ ${kernel_compat_mode} == realloc ]]; then
+    if [[ -e ${PCI_REALLOC_OWNER_MARKER} ]]; then
+        echo "Stack-managed ${EGPU_PCI_REALLOC_KARG} is already staged for Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+."
+    else
+        echo "Existing user-managed ${EGPU_PCI_REALLOC_KARG} satisfies Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+ compatibility."
+    fi
+else
+    echo "Using the unchanged legacy PCI flow on kernel $(uname -r)."
 fi
 
 regenerate_initramfs_if_needed "${initramfs_config_changed}"
@@ -134,6 +174,7 @@ fi
 echo "  - guarded persistent PCIe Gen4 x4: armed"
 echo "  - NVIDIA-first KWin order and safe-detach widget: installed"
 echo "  - automatic NVIDIA loading and ublue-nvctk-cdi: blocked"
+echo "  - kernel PCI compatibility mode: ${kernel_compat_mode}"
 echo
 echo "No global PCI bus renumbering is used. Thunderbolt authorization is never cycled."
 echo "Use a warm reboot with the validated chain left powered and connected."

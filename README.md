@@ -42,6 +42,29 @@ KWin, and provides a safe-detach Plasma widget.
 
 The read-only preflight reports any missing command before installation.
 
+## Kernel compatibility
+
+The installer selects the PCI rescan behavior from the running kernel release:
+
+- kernels older than 7.2 keep the original validated path unchanged, without a
+  project-managed `pci=realloc=on` argument;
+- Linux 7.2 and newer use the same local TH5P4 register programming and strict
+  post-rescan verifier, with the standard `pci=realloc=on` pass enabled so the
+  PCI core can preserve/reassign the prepared hot-plug bridge windows.
+
+This is deliberately not a return to the retired global experiment. The stack
+never adds `pci=assign-busses`, `hpbussize`, `hpmmiosize` or
+`hpmmioprefsize`; firmware numbering and the AMD iGPU BDF remain untouched. If
+the new-kernel argument is absent, the early service fails closed before PCI
+surgery and the tray reports a PCI-reserve failure instead of calling its own
+internal rescan a physical reconnect.
+
+The installer records ownership only when it adds the exact
+`pci=realloc=on` argument itself. A rerun after booting an older kernel removes
+that project-owned argument and restores the legacy behavior. A pre-existing
+user-owned argument is preserved by both installation and rollback. After a
+major kernel update, rerun the installer and reboot before judging eGPU output.
+
 ## Install the bundled profile
 
 From this directory:
@@ -194,7 +217,8 @@ only this stack's exact NVIDIA initramfs omission while preserving unrelated
 dracut arguments such as encrypted-root support. The retired global PCI
 reservation experiments (`install-pci-hotplug-reserve.sh` and
 `verify-pci-hotplug-reserve.sh`) are retained only as diagnostic history and
-must not be combined with the local profile.
+must not be combined with the local profile. It removes `pci=realloc=on` only
+when the version-aware installer recorded that this project added it.
 
 ## Acknowledgements
 

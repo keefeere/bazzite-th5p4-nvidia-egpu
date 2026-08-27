@@ -7,6 +7,8 @@ warnings=0
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
+# shellcheck source=egpu-kernel-compat.sh
+source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
 
 pass() {
     printf 'PASS  %s\n' "$1"
@@ -37,6 +39,34 @@ printf '%s\n' 'NVIDIA eGPU final-stack verification'
 pass "hardware profile: ${PROFILE_NAME}"
 
 cmdline=" $(</proc/cmdline) "
+kernel_release=$(uname -r)
+if kernel_compat_mode=$(egpu_kernel_compat_mode "${kernel_release}"); then
+    pass "kernel ${kernel_release} selected ${kernel_compat_mode} PCI compatibility mode"
+else
+    fail "unsupported kernel release format: ${kernel_release}"
+    kernel_compat_mode=unknown
+fi
+
+if [[ ${kernel_compat_mode} == realloc ]]; then
+    if egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_REALLOC_KARG}"; then
+        pass "Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+ compatibility argument ${EGPU_PCI_REALLOC_KARG} is active"
+        if [[ -e /etc/egpu-nvidia/managed-pci-realloc ]]; then
+            pass "version-aware installer owns the exact PCI realloc argument"
+        else
+            pass "pre-existing user-managed PCI realloc argument is preserved"
+        fi
+    else
+        fail "Linux ${EGPU_PCI_REALLOC_MIN_KERNEL}+ requires active ${EGPU_PCI_REALLOC_KARG}; rerun the installer and reboot"
+    fi
+elif [[ ${kernel_compat_mode} == legacy ]]; then
+    pass "pre-${EGPU_PCI_REALLOC_MIN_KERNEL} kernel retains the unchanged legacy PCI flow"
+    if [[ -e /etc/egpu-nvidia/managed-pci-realloc ]]; then
+        fail "stale stack-managed ${EGPU_PCI_REALLOC_KARG} marker on a legacy kernel; rerun the installer"
+    elif egpu_cmdline_has_arg "${cmdline}" "${EGPU_PCI_REALLOC_KARG}"; then
+        warn "user-managed ${EGPU_PCI_REALLOC_KARG} is active but is not required by the validated legacy flow"
+    fi
+fi
+
 if [[ ${cmdline} == *' pci=assign-busses'* ||
       ${cmdline} == *'hpbussize='* ||
       ${cmdline} == *'hpmmiosize='* ||

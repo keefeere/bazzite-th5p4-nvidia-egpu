@@ -13,6 +13,7 @@ PENDING_MARKER="/run/egpu-nvidia-hotplug-pending"
 LATE_MARKER="/run/egpu-nvidia-late-loaded"
 KWIN_ENV="/etc/environment.d/10kwin-egpu.conf"
 DETACH_BLOCK_MARKER="/run/egpu-nvidia-detach-block"
+LOCAL_RESERVE_FAILURE_MARKER="/run/egpu-local-reserve-failed"
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
@@ -59,10 +60,18 @@ if [[ -e /etc/egpu-nvidia/enable-local-reserve ]]; then
 fi
 if (( reserve_needs_manual_rebuild )); then
     install -D -m 0644 /dev/null /run/egpu-nvidia-reboot-required
-    printf '%s\n' \
-        "The physically reconnected NVIDIA eGPU needs a reboot to restore its validated PCI resources." \
-        "The current AMD session remains untouched; NVIDIA will not be loaded in this boot." \
-        > "${PENDING_MARKER}"
+    if [[ -s ${LOCAL_RESERVE_FAILURE_MARKER} ]]; then
+        {
+            cat -- "${LOCAL_RESERVE_FAILURE_MARKER}"
+            echo "This was an early reserve failure, not a physical cable reconnect."
+            echo "Correct the kernel compatibility state, then reboot with the enclosure attached."
+        } > "${PENDING_MARKER}"
+    else
+        printf '%s\n' \
+            "The physically reconnected NVIDIA eGPU needs a reboot to restore its validated PCI resources." \
+            "The current AMD session remains untouched; NVIDIA will not be loaded in this boot." \
+            > "${PENDING_MARKER}"
+    fi
     rm -f -- "${LATE_MARKER}"
     cat "${PENDING_MARKER}"
     exit 0

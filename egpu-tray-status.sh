@@ -7,6 +7,7 @@ DETACH_BLOCK_MARKER="/run/egpu-nvidia-detach-block"
 DETACH_SERVICE="egpu-nvidia-detach.service"
 ATTACH_SERVICE="egpu-nvidia-hot-attach.service"
 REBOOT_MARKER="/run/egpu-nvidia-reboot-required"
+LOCAL_RESERVE_FAILURE_MARKER="/run/egpu-local-reserve-failed"
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
@@ -67,6 +68,12 @@ if systemctl is-failed --quiet "${DETACH_SERVICE}"; then
     emit error \
         "$(tr "Detach failed" "Помилка від’єднання")" \
         "$(tr "Do not unplug the cable. Check ${DETACH_SERVICE}." "Кабель не від’єднувати. Перевір ${DETACH_SERVICE}.")"
+fi
+
+if [[ -s ${LOCAL_RESERVE_FAILURE_MARKER} ]]; then
+    emit error \
+        "$(tr "PCI reserve failed" "Помилка резервування PCI")" \
+        "$(tr "NVIDIA stayed blocked. Check egpu-nvidia-boot.service, correct the kernel compatibility state, then reboot." "NVIDIA лишилася заблокованою. Перевір egpu-nvidia-boot.service, виправ стан сумісності ядра та перезавантаж систему.")"
 fi
 
 if [[ -e ${REBOOT_MARKER} ]] ||

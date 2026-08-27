@@ -75,6 +75,7 @@ install -m 0755 \
     "${INSTALL_DIR}/"
 install -m 0644 \
     "${SOURCE_DIR}/egpu-pci-lib.sh" \
+    "${SOURCE_DIR}/egpu-kernel-compat.sh" \
     "${SOURCE_DIR}/nvidia-base-only.conf" \
     "${INSTALL_DIR}/"
 install -m 0644 \

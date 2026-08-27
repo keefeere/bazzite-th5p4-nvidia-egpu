@@ -9,6 +9,8 @@ fi
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PLASMOID_ID="com.keefeere.egpu"
 INITRAMFS_DRIVER_LIST="nvidia nvidia_drm nvidia_modeset nvidia_peermem nvidia_uvm"
+managed_pci_realloc=0
+[[ -e /etc/egpu-nvidia/managed-pci-realloc ]] && managed_pci_realloc=1
 
 desktop_home=""
 # Rollback must remain possible even if an edited installed profile is broken.
@@ -64,9 +66,15 @@ for arg in "${filtered_args[@]}"; do
 done
 "${initramfs_command[@]}"
 
-rpm-ostree kargs \
-    --delete-if-present="thunderbolt.host_reset=0" \
+kargs_command=(
+    rpm-ostree kargs
+    --delete-if-present="thunderbolt.host_reset=0"
     --delete-if-present="thunderbolt.clx=0"
+)
+if (( managed_pci_realloc )); then
+    kargs_command+=(--delete-if-present="pci=realloc=on")
+fi
+"${kargs_command[@]}"
 
 echo
 echo "Removed the custom eGPU services, policy, widget and module/initramfs overrides."
