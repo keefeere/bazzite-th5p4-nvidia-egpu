@@ -8,6 +8,7 @@ DETACH_SERVICE="egpu-nvidia-detach.service"
 ATTACH_SERVICE="egpu-nvidia-hot-attach.service"
 REBOOT_MARKER="/run/egpu-nvidia-reboot-required"
 LOCAL_RESERVE_FAILURE_MARKER="/run/egpu-local-reserve-failed"
+PCIEHP_QUARANTINE_MARKER="/run/egpu-pciehp-quarantined"
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
@@ -109,7 +110,10 @@ fi
 if grep -q '^nvidia_drm ' /proc/modules &&
    compgen -G "/sys/bus/pci/devices/${GPU}/drm/card*" >/dev/null; then
     egpu_card="$(find "/sys/bus/pci/devices/${GPU}/drm" -mindepth 1 -maxdepth 1 -name 'card[0-9]*' -printf '/dev/dri/%f\n' | head -n 1)"
-    live_kwin_order="$(systemctl --user show-environment 2>/dev/null | sed -n 's/^KWIN_DRM_DEVICES=//p')"
+    live_kwin_order="$(
+        { systemctl --user show-environment 2>/dev/null || true; } |
+            sed -n 's/^KWIN_DRM_DEVICES=//p'
+    )"
     if [[ ${live_kwin_order%%:*} != "${egpu_card}" ]]; then
         emit present \
             "$(tr "${EGPU_DISPLAY_NAME} is loaded" "${EGPU_DISPLAY_NAME} — завантажена")" \
@@ -122,6 +126,11 @@ if grep -q '^nvidia_drm ' /proc/modules &&
         "8.0 GT/s PCIe") link="PCIe Gen3 x${width:-?}" ;;
         *) link="${speed:-PCIe} x${width:-?}" ;;
     esac
+    if [[ -s ${PCIEHP_QUARANTINE_MARKER} ]]; then
+        emit ready \
+            "$(tr "${EGPU_DISPLAY_NAME} is active" "${EGPU_DISPLAY_NAME} — активна")" \
+            "$(tr "${link}. Downstream PCIe hot-add is disabled until reboot; USB remains available. Click to safely detach the eGPU." "${link}. Downstream PCIe hot-add вимкнено до перезавантаження; USB працює. Натисни для безпечного від’єднання eGPU.")"
+    fi
     emit ready \
         "$(tr "${EGPU_DISPLAY_NAME} is active" "${EGPU_DISPLAY_NAME} — активна")" \
         "$(tr "${link}. Click to safely detach the eGPU." "${link}. Натисни для безпечного від’єднання eGPU.")"

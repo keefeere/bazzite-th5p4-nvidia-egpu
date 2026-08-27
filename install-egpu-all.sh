@@ -132,18 +132,32 @@ install -D -m 0644 "${SOURCE_DIR}/99-nvidia.conf" "/etc/dracut.conf.d/99-nvidia.
 install -D -m 0644 "${SOURCE_DIR}/zz-egpu-delay.conf" "/etc/dracut.conf.d/zz-egpu-delay.conf"
 install -D -m 0644 "${SOURCE_DIR}/99-egpu-delay-nvidia.conf" "/etc/modprobe.d/99-egpu-delay-nvidia.conf"
 
-# These two arguments prevent controller resets/low-power transitions that
-# were correlated with the original USB4/eGPU instability. Linux 7.2+ also
-# needs the measured 32 MiB hot-plug memory policy because its rewritten PCI
-# allocator no longer preserves oversized empty bridge windows. Older kernels
-# deliberately keep the previously validated flow byte-for-byte unchanged.
+# Keep low-power lane states disabled on every tested kernel. The original
+# 6.17 deployment also keeps its validated host_reset=0 workaround unchanged,
+# while Linux 7.2+ uses the upstream host-router reset default: an A/B test on
+# this AMD USB4 host showed that host_reset=0 repeatedly failed TB_PORT_UP on a
+# first hot-plug, while the default enumerated TH5P4 and RTX in one second.
+# Linux 7.2+ additionally needs the measured 32 MiB hot-plug memory policy.
 current_kargs=" $(rpm-ostree kargs) "
 kargs_command=(rpm-ostree kargs)
-for arg in thunderbolt.host_reset=0 thunderbolt.clx=0; do
-    if [[ ${current_kargs} != *" ${arg} "* ]]; then
-        kargs_command+=("--append-if-missing=${arg}")
-    fi
-done
+if ! egpu_cmdline_has_arg "${current_kargs}" thunderbolt.clx=0; then
+    kargs_command+=(--append-if-missing=thunderbolt.clx=0)
+fi
+manage_host_reset=$(egpu_managed_host_reset_action \
+    "$(uname -r)" "${current_kargs}") || {
+    echo "Could not select the kernel USB4 host-reset action." >&2
+    exit 1
+}
+case ${manage_host_reset} in
+    add)
+        kargs_command+=("--append-if-missing=${EGPU_TB_HOST_RESET_KARG}")
+        ;;
+    remove)
+        kargs_command+=("--delete-if-present=${EGPU_TB_HOST_RESET_KARG}")
+        ;;
+    keep) ;;
+    *) echo "Invalid USB4 host-reset action: ${manage_host_reset}" >&2; exit 1 ;;
+esac
 managed_pci_realloc=0
 [[ -e ${PCI_REALLOC_OWNER_MARKER} ]] && managed_pci_realloc=1
 manage_pci_realloc=$(egpu_managed_realloc_migration_action \
@@ -181,6 +195,21 @@ if ((${#kargs_command[@]} > 2)); then
 else
     echo "The tested kernel arguments are already staged for ${kernel_compat_mode} PCI compatibility mode."
 fi
+case ${manage_host_reset} in
+    add)
+        echo "Staged the validated legacy ${EGPU_TB_HOST_RESET_KARG} workaround."
+        ;;
+    remove)
+        echo "Removed ${EGPU_TB_HOST_RESET_KARG}; Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+ uses the tested upstream host-router reset default."
+        ;;
+    keep)
+        if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+            echo "Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+ is already using the tested upstream USB4 host-router reset default."
+        else
+            echo "The validated legacy ${EGPU_TB_HOST_RESET_KARG} workaround is already staged."
+        fi
+        ;;
+esac
 if [[ ${manage_pci_realloc} == remove || ${manage_pci_realloc} == cleanup ]]; then
     rm -f -- "${PCI_REALLOC_OWNER_MARKER}"
     echo "Removed the rejected stack-managed ${EGPU_PCI_REALLOC_KARG}."
@@ -235,6 +264,11 @@ echo "  - guarded persistent PCIe Gen4 x4: armed"
 echo "  - NVIDIA-first KWin order and safe-detach widget: installed"
 echo "  - automatic NVIDIA loading and ublue-nvctk-cdi: blocked"
 echo "  - kernel PCI compatibility mode: ${kernel_compat_mode}"
+if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+    echo "  - USB4 host-router reset policy: upstream default (first hot-plug tested)"
+else
+    echo "  - USB4 host-router reset policy: legacy host_reset=0 workaround"
+fi
 echo
 echo "No global PCI bus renumbering is used. Thunderbolt authorization is never cycled."
 echo "Use a warm reboot with the validated chain left powered and connected."

@@ -10,6 +10,7 @@ EGPU_PCI_COMPAT_MIN_KERNEL="7.2.0"
 EGPU_PCI_HOTPLUG_KARG="pci=hpmmiosize=32M,hpmmioprefsize=32M"
 EGPU_PCI_HOTPLUG_MMIO_BYTES=$((32 * 1024 * 1024))
 EGPU_PCI_HOTPLUG_PREF_BYTES=$((32 * 1024 * 1024))
+EGPU_TB_HOST_RESET_KARG="thunderbolt.host_reset=0"
 
 # Migration-only: an earlier, rejected 7.2 experiment used this argument.
 # It globally repacked the TH5P4 hierarchy at boot and must never be required.
@@ -61,6 +62,29 @@ egpu_kernel_compat_mode() {
             1) printf '%s\n' legacy ;;
             *) return 2 ;;
         esac
+    fi
+}
+
+# The original 6.17 deployment needed host_reset=0 for stable cold-attached
+# operation. On the tested 7.2 AMD USB4 stack it prevents a freshly booted
+# host router from bringing a first hot-plugged TH5P4 to TB_PORT_UP. Keep the
+# old-kernel behavior unchanged and return to the upstream default reset on
+# 7.2+.
+egpu_managed_host_reset_action() {
+    local release=$1 cmdline=$2
+    local mode
+
+    mode=$(egpu_kernel_compat_mode "${release}") || return 2
+    if [[ ${mode} == legacy ]]; then
+        if egpu_cmdline_has_arg "${cmdline}" "${EGPU_TB_HOST_RESET_KARG}"; then
+            printf '%s\n' keep
+        else
+            printf '%s\n' add
+        fi
+    elif egpu_cmdline_has_arg "${cmdline}" "${EGPU_TB_HOST_RESET_KARG}"; then
+        printf '%s\n' remove
+    else
+        printf '%s\n' keep
     fi
 }
 

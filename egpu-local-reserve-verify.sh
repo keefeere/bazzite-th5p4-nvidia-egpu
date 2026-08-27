@@ -3,6 +3,12 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 APPLIED_MARKER="/run/egpu-local-reserve-applied"
+DYNAMIC_REBAR_MARKER_TEXT="TH5P4 late-hotplug dynamic ReBAR repair is active."
+dynamic_rebar_mode=${EGPU_ALLOW_DYNAMIC_REBAR:-0}
+if [[ -s ${APPLIED_MARKER} ]] &&
+   grep -Fqx -- "${DYNAMIC_REBAR_MARKER_TEXT}" "${APPLIED_MARKER}"; then
+    dynamic_rebar_mode=1
+fi
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
@@ -19,6 +25,14 @@ if [[ ${kernel_compat_mode} == hotplug-size ]]; then
 else
     required_p1_mmio=${TARGET_MMIO_BYTES}
     required_p1_pref=${TARGET_PREF_BYTES}
+fi
+required_p1_io=${MIN_IO_BYTES}
+if ((dynamic_rebar_mode)); then
+    # The kernel-managed late ReBAR transition distributes the 16 KiB parent
+    # I/O aperture evenly across the three empty ports. PCIe hot-add on the HP
+    # port is quarantined in this mode, so only the bridge's own 4 KiB window
+    # is required until reboot restores the full early-boot reservation.
+    required_p1_io=4096
 fi
 
 die() {
@@ -100,6 +114,31 @@ expect_before() {
     ((left_end < right_start)) || die "${label} windows overlap or are out of order"
 }
 
+expect_disjoint() {
+    local left_start=$1
+    local left_end=$2
+    local right_start=$3
+    local right_end=$4
+    local label=$5
+
+    ((left_end < right_start || right_end < left_start)) ||
+        die "${label} windows overlap"
+}
+
+expect_inside_either() {
+    local first_start=$1
+    local first_end=$2
+    local second_start=$3
+    local second_end=$4
+    local child_start=$5
+    local child_end=$6
+    local label=$7
+
+    ((child_start >= first_start && child_end <= first_end)) ||
+        ((child_start >= second_start && child_end <= second_end)) ||
+        die "${label} is outside both parent MMIO apertures"
+}
+
 resolve_egpu_topology
 validate_expected_topology || die "live BDF layout differs from the configured profile"
 
@@ -129,7 +168,9 @@ expect_bus_range "${PORT3}" "${PORT3_BUS_START}" "${PORT3_BUS_END}"
 # survive byte-for-byte.
 expect_window "${ROOT_PORT}" 14 "${ROOT_IO_START}" "${ROOT_IO_END}" "I/O"
 expect_window "${ROOT_PORT}" 15 "${ROOT_MMIO_START}" "${ROOT_MMIO_END}" "MMIO"
-expect_window "${ROOT_PORT}" 16 "${ROOT_PREF_START}" "${ROOT_PREF_END}" "MMIO_PREF"
+if (( ! dynamic_rebar_mode )); then
+    expect_window "${ROOT_PORT}" 16 "${ROOT_PREF_START}" "${ROOT_PREF_END}" "MMIO_PREF"
+fi
 
 for spec in \
     "root_io ${ROOT_PORT} 14" "root_mem ${ROOT_PORT} 15" "root_pref ${ROOT_PORT} 16" \
@@ -152,15 +193,29 @@ expect_inside "${root_io_start}" "${root_io_end}" "${up_io_start}" "${up_io_end}
 expect_inside "${root_mem_start}" "${root_mem_end}" "${up_mem_start}" "${up_mem_end}" "TH5P4 MMIO"
 expect_inside "${root_pref_start}" "${root_pref_end}" "${up_pref_start}" "${up_pref_end}" "TH5P4 MMIO_PREF"
 
+if ((dynamic_rebar_mode)); then
+    ((root_pref_flags != 0 &&
+      $(window_size "${root_pref_start}" "${root_pref_end}") >= EGPU_BAR1_SIZE + EGPU_BAR3_SIZE)) ||
+        die "dynamic root MMIO_PREF cannot contain the complete RTX ReBAR aperture"
+fi
+
 expect_inside "${up_io_start}" "${up_io_end}" "${gpu_io_start}" "${gpu_io_end}" "RTX I/O"
 expect_inside "${up_mem_start}" "${up_mem_end}" "${gpu_mem_start}" "${gpu_mem_end}" "RTX MMIO"
 expect_inside "${up_pref_start}" "${up_pref_end}" "${gpu_pref_start}" "${gpu_pref_end}" "RTX MMIO_PREF"
 expect_inside "${up_io_start}" "${up_io_end}" "${p1_io_start}" "${p1_io_end}" "HP-port I/O"
 expect_inside "${up_mem_start}" "${up_mem_end}" "${p1_mem_start}" "${p1_mem_end}" "HP-port MMIO"
-expect_inside "${up_pref_start}" "${up_pref_end}" "${p1_pref_start}" "${p1_pref_end}" "HP-port MMIO_PREF"
+if ((dynamic_rebar_mode)); then
+    # The 7.2 allocator may place an empty child's prefetchable aperture inside
+    # the parent's ordinary MMIO window while keeping RTX ReBAR in MMIO_PREF.
+    expect_inside_either \
+        "${up_mem_start}" "${up_mem_end}" "${up_pref_start}" "${up_pref_end}" \
+        "${p1_pref_start}" "${p1_pref_end}" "HP-port MMIO_PREF"
+else
+    expect_inside "${up_pref_start}" "${up_pref_end}" "${p1_pref_start}" "${p1_pref_end}" "HP-port MMIO_PREF"
+fi
 
-(( $(window_size "${p1_io_start}" "${p1_io_end}") >= MIN_IO_BYTES )) ||
-    die "dock-port I/O reserve is smaller than the profile minimum"
+(( $(window_size "${p1_io_start}" "${p1_io_end}") >= required_p1_io )) ||
+    die "dock-port I/O reserve is smaller than the ${kernel_compat_mode} runtime requirement"
 (( $(window_size "${p1_mem_start}" "${p1_mem_end}") >= required_p1_mmio )) ||
     die "dock-port MMIO reserve is smaller than the ${kernel_compat_mode} requirement"
 (( $(window_size "${p1_pref_start}" "${p1_pref_end}") >= required_p1_pref )) ||
@@ -168,14 +223,34 @@ expect_inside "${up_pref_start}" "${up_pref_end}" "${p1_pref_start}" "${p1_pref_
 
 expect_before "${gpu_io_end}" "${p1_io_start}" "RTX/HP-port I/O"
 expect_before "${gpu_mem_end}" "${p1_mem_start}" "RTX/HP-port MMIO"
-expect_before "${gpu_pref_end}" "${p1_pref_start}" "RTX/HP-port MMIO_PREF"
+if ((dynamic_rebar_mode)); then
+    expect_disjoint "${gpu_pref_start}" "${gpu_pref_end}" \
+        "${p1_pref_start}" "${p1_pref_end}" "RTX/HP-port MMIO_PREF"
+else
+    expect_before "${gpu_pref_end}" "${p1_pref_start}" "RTX/HP-port MMIO_PREF"
+fi
 
 # On legacy kernels the two unused ports remain disabled or receive Linux's
 # 2 MiB defaults. Linux 7.2+ deliberately gives every empty hot-plug port the
 # measured 32 MiB minimum because its allocator no longer retains port1's
 # pre-programmed 128 MiB/1 GiB window.
-expect_disabled_window "${PORT2}" 14 "I/O"
-expect_disabled_window "${PORT3}" 14 "I/O"
+if ((dynamic_rebar_mode)); then
+    for prefix in p2_io p3_io; do
+        flags_name="${prefix}_flags"
+        start_name="${prefix}_start"
+        end_name="${prefix}_end"
+        ((${!flags_name} != 0)) || die "${prefix} dynamic I/O window is disabled"
+        (( $(window_size "${!start_name}" "${!end_name}") >= 4096 )) ||
+            die "${prefix} dynamic I/O window is smaller than 4 KiB"
+        expect_inside "${up_io_start}" "${up_io_end}" \
+            "${!start_name}" "${!end_name}" "${prefix} dynamic I/O"
+    done
+    expect_before "${p1_io_end}" "${p2_io_start}" "HP-port/port2 I/O"
+    expect_before "${p2_io_end}" "${p3_io_start}" "port2/port3 I/O"
+else
+    expect_disabled_window "${PORT2}" 14 "I/O"
+    expect_disabled_window "${PORT3}" 14 "I/O"
+fi
 for prefix in p2_mem p2_pref p3_mem p3_pref; do
     flags_name="${prefix}_flags"
     start_name="${prefix}_start"
@@ -202,11 +277,23 @@ if ((p3_mem_flags != 0)); then
     ((p2_mem_flags != 0)) && expect_before "${p2_mem_end}" "${p3_mem_start}" "port2/port3 MMIO"
 fi
 if ((p2_pref_flags != 0)); then
-    expect_inside "${up_pref_start}" "${up_pref_end}" "${p2_pref_start}" "${p2_pref_end}" "port2 MMIO_PREF"
+    if ((dynamic_rebar_mode)); then
+        expect_inside_either \
+            "${up_mem_start}" "${up_mem_end}" "${up_pref_start}" "${up_pref_end}" \
+            "${p2_pref_start}" "${p2_pref_end}" "port2 MMIO_PREF"
+    else
+        expect_inside "${up_pref_start}" "${up_pref_end}" "${p2_pref_start}" "${p2_pref_end}" "port2 MMIO_PREF"
+    fi
     expect_before "${p1_pref_end}" "${p2_pref_start}" "HP-port/port2 MMIO_PREF"
 fi
 if ((p3_pref_flags != 0)); then
-    expect_inside "${up_pref_start}" "${up_pref_end}" "${p3_pref_start}" "${p3_pref_end}" "port3 MMIO_PREF"
+    if ((dynamic_rebar_mode)); then
+        expect_inside_either \
+            "${up_mem_start}" "${up_mem_end}" "${up_pref_start}" "${up_pref_end}" \
+            "${p3_pref_start}" "${p3_pref_end}" "port3 MMIO_PREF"
+    else
+        expect_inside "${up_pref_start}" "${up_pref_end}" "${p3_pref_start}" "${p3_pref_end}" "port3 MMIO_PREF"
+    fi
     ((p2_pref_flags != 0)) && expect_before "${p2_pref_end}" "${p3_pref_start}" "port2/port3 MMIO_PREF"
 fi
 

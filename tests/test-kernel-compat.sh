@@ -46,6 +46,15 @@ expect_equal hotplug-size "$(egpu_kernel_compat_mode 7.2.0-ogc6.1.fc44.x86_64)" 
 expect_equal hotplug-size "$(egpu_kernel_compat_mode 8.0.0-test)" \
     "future kernel remains on guarded hot-plug sizing mode"
 
+expect_equal add "$(egpu_managed_host_reset_action 6.17.7 'quiet splash')" \
+    "old kernel adds its validated host-reset workaround"
+expect_equal keep "$(egpu_managed_host_reset_action 6.17.7 'quiet thunderbolt.host_reset=0')" \
+    "old kernel keeps its validated host-reset workaround"
+expect_equal remove "$(egpu_managed_host_reset_action 7.2.0 'quiet thunderbolt.host_reset=0')" \
+    "new kernel removes the legacy host-reset workaround"
+expect_equal keep "$(egpu_managed_host_reset_action 7.2.0 'quiet splash')" \
+    "new kernel keeps the upstream host-router reset default"
+
 new_karg='pci=hpmmiosize=32M,hpmmioprefsize=32M'
 expect_equal keep "$(egpu_managed_hotplug_size_action 6.17.7 'quiet splash' 0)" \
     "old kernel leaves its validated flow untouched"

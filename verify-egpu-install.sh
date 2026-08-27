@@ -95,13 +95,27 @@ else
     pass "no unsupported PCI hot-plug sizing arguments are active"
 fi
 
-for arg in thunderbolt.host_reset=0 thunderbolt.clx=0; do
-    if [[ ${cmdline} == *" ${arg} "* ]]; then
-        pass "kernel argument ${arg}"
+if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+    if egpu_cmdline_has_arg "${cmdline}" "${EGPU_TB_HOST_RESET_KARG}"; then
+        fail "Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+ still has legacy ${EGPU_TB_HOST_RESET_KARG}; first USB4 hot-plug may fail"
+    elif [[ -r /sys/module/thunderbolt/parameters/host_reset ]] &&
+         [[ $(< /sys/module/thunderbolt/parameters/host_reset) == Y ]]; then
+        pass "Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+ uses the tested upstream USB4 host-router reset default"
     else
-        warn "kernel argument ${arg} is staged but not active yet; reboot required"
+        fail "USB4 host-router reset default is not active on Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+"
     fi
-done
+elif [[ ${kernel_compat_mode} == legacy ]]; then
+    if egpu_cmdline_has_arg "${cmdline}" "${EGPU_TB_HOST_RESET_KARG}"; then
+        pass "legacy kernel argument ${EGPU_TB_HOST_RESET_KARG}"
+    else
+        warn "legacy ${EGPU_TB_HOST_RESET_KARG} is staged but not active yet; reboot required"
+    fi
+fi
+if egpu_cmdline_has_arg "${cmdline}" thunderbolt.clx=0; then
+    pass "kernel argument thunderbolt.clx=0"
+else
+    warn "kernel argument thunderbolt.clx=0 is staged but not active yet; reboot required"
+fi
 
 check_file /etc/egpu-nvidia/enable-local-reserve "local ${ENCLOSURE_DISPLAY_NAME} reservation enabled"
 check_file /etc/egpu-nvidia/hardware.conf "versioned hardware profile installed"
@@ -181,7 +195,22 @@ if resolve_egpu_topology 2>/dev/null; then
         fail "nvidia-smi cannot access the RTX"
     fi
 
-    if hp_dock_router_present; then
+    dynamic_rebar_mode=0
+    if [[ -s /run/egpu-local-reserve-applied ]] &&
+       grep -Fqx -- "TH5P4 late-hotplug dynamic ReBAR repair is active." \
+           /run/egpu-local-reserve-applied; then
+        dynamic_rebar_mode=1
+        dock_service="${EXPECTED_GPU_BRIDGE_BDF%:*}:01.0:pcie204"
+        if [[ -s /run/egpu-pciehp-quarantined &&
+              -d /sys/bus/pci_express/devices/${dock_service} &&
+              ! -L /sys/bus/pci_express/devices/${dock_service}/driver ]]; then
+            pass "Linux 7.2 dynamic ReBAR mode quarantined ${DOCK_DISPLAY_NAME} PCIe hot-add until reboot"
+        else
+            fail "dynamic ReBAR mode lacks the exact ${DOCK_DISPLAY_NAME} pciehp quarantine"
+        fi
+    fi
+
+    if hp_dock_router_present && (( ! dynamic_rebar_mode )); then
         topology_verify="${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
         if topology_output="$("${topology_verify}" 2>&1)"; then
             pass "local reserve and complete ${DOCK_DISPLAY_NAME} PCI subtree verified"
@@ -233,6 +262,9 @@ if resolve_egpu_topology 2>/dev/null; then
             pass "local ${ENCLOSURE_DISPLAY_NAME} reservation verified"
         else
             fail "local-reserve verifier: ${topology_output##*$'\n'}"
+        fi
+        if ((dynamic_rebar_mode)); then
+            warn "${DOCK_DISPLAY_NAME} PCIe/Ethernet hot-add is disabled for this late-hotplug boot; reboot with the dock attached for full function"
         fi
     fi
 else

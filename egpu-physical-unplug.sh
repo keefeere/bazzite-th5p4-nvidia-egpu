@@ -11,6 +11,7 @@ if [[ -s /run/egpu-safe-to-unplug && -e /run/egpu-nvidia-detach-block ]]; then
         /run/egpu-nvidia-hotplug-pending \
         /run/egpu-nvidia-late-loaded \
         /run/egpu-local-reserve-applied \
+        /run/egpu-pciehp-quarantined \
         /run/egpu-local-reserve-before.txt \
         /run/egpu-gen4-test-active
     install -D -m 0644 /dev/null /run/egpu-nvidia-reboot-required

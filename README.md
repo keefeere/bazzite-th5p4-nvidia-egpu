@@ -160,11 +160,27 @@ child-only rescan.
 
 Physically unplugging the enclosure invalidates the runtime bridge reservation.
 On this validated machine, a same-boot cable replug enumerates the RTX with a
-256 MiB BAR1 instead of 16 GiB and can leave the nested dock PCI tree partial.
-The exact TH5P4 remove event therefore clears stale runtime state and marks the
-eGPU as requiring a reboot. A replug remains safely driverless and does not end
-the AMD session; reboot with the chain attached to restore the complete PCI
-tree. The scripts intentionally do not attempt a live ReBAR/peer-tree rewrite.
+256 MiB BAR1 instead of 16 GiB. The exact TH5P4 remove event therefore clears
+stale runtime state, and the automatic add event keeps the reappearing GPU
+driverless so the AMD session is not disrupted.
+
+On Linux 7.2+, an explicit **Connect eGPU** action can repair the exact bundled
+profile without rebooting. It requires the HP Dock to be absent, validates the
+driver-free 256 MiB input state and every sibling bridge, ends the graphical
+session, removes only the three empty TH5P4 ports, and requests a 16 GiB BAR1
+through the kernel's `resource1_resize` interface. The relocated parent and GPU
+windows, endpoint BARs, bus ranges, containment and non-overlap must all pass
+before NVIDIA is allowed to bind. An interrupted operation can resume only
+after the already-resized layout passes the same verifier.
+
+The 7.2 allocator leaves only 4 KiB of I/O on each empty downstream port in
+this dynamic layout, less than the complete HP Dock PCI tree was validated
+with. The repair therefore unbinds `pciehp` only from the exact HP-facing port
+until reboot. NVIDIA outputs and enclosure USB remain available, but HP Dock
+PCIe/Ethernet hot-add is deliberately disabled for that boot. Reboot with the
+dock attached for full dock function and the normal early Gen4 path. The live
+repair uses conservative Gen3. Older kernels and any topology outside the
+strict profile continue to require a reboot rather than attempting ReBAR.
 
 The profile also loads `nvidia_drm` with `fbdev=0`. The integrated GPU remains
 the fallback VT/framebuffer device; otherwise NVIDIA's kernel framebuffer can
@@ -248,6 +264,10 @@ the same ownership rule for the Linux 7.2+ 32 MiB sizing argument.
 [@ewagner12](https://github.com/ewagner12) was an early reference and source of
 inspiration for making an eGPU primary on Wayland, particularly the compositor
 primary-GPU environment approach and the `thunderbolt.host_reset=0` workaround.
+That workaround remains enabled only for the original pre-7.2 validated kernel
+path. Linux 7.2+ uses the upstream host-router reset default after a controlled
+A/B test showed that it is required for reliable first TH5P4 hot-plug on the
+profiled AMD USB4 host.
 No `all-ways-egpu` source code is vendored here; this project's hardware-specific
 PCI resource staging, NVIDIA initialization, downstream-dock handling and safe
 detach flow are separate implementations.
