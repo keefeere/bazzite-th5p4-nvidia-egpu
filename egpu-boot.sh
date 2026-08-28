@@ -59,20 +59,6 @@ expected_router_present() {
     th5p4_router_present
 }
 
-hp_pci_subtree_present() {
-    local port1 sysfs bdf
-
-    port1="${BRIDGE%:*}:01.0"
-    for sysfs in /sys/bus/pci/devices/0000:*; do
-        bdf=${sysfs##*/}
-        [[ ${bdf} == "${port1}" ]] && continue
-        if is_pci_descendant_of "${bdf}" "${port1}"; then
-            return 0
-        fi
-    done
-    return 1
-}
-
 record_local_reserve_failure() {
     local stage=$1
     local rc=$2
