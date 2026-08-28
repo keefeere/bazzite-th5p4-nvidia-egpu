@@ -228,10 +228,18 @@ if resolve_egpu_topology 2>/dev/null; then
     fi
 
     dynamic_rebar_mode=0
+    no_dock_cold_rebar_mode=0
     if [[ -s /run/egpu-local-reserve-applied ]] &&
-       grep -Fqx -- "TH5P4 late-hotplug dynamic ReBAR repair is active." \
+       grep -Fqx -- "TH5P4 no-dock cold-boot dynamic ReBAR repair is active." \
            /run/egpu-local-reserve-applied; then
         dynamic_rebar_mode=1
+        no_dock_cold_rebar_mode=1
+    elif [[ -s /run/egpu-local-reserve-applied ]] &&
+         grep -Fqx -- "TH5P4 late-hotplug dynamic ReBAR repair is active." \
+             /run/egpu-local-reserve-applied; then
+        dynamic_rebar_mode=1
+    fi
+    if ((dynamic_rebar_mode)); then
         dock_service="${EXPECTED_GPU_BRIDGE_BDF%:*}:01.0:pcie204"
         if [[ -s /run/egpu-pciehp-quarantined &&
               -d /sys/bus/pci_express/devices/${dock_service} &&
@@ -295,8 +303,10 @@ if resolve_egpu_topology 2>/dev/null; then
         else
             fail "local-reserve verifier: ${topology_output##*$'\n'}"
         fi
-        if ((dynamic_rebar_mode)); then
-            warn "${DOCK_DISPLAY_NAME} PCIe/Ethernet hot-add is disabled for this late-hotplug boot; reboot with the dock attached for full function"
+        if ((no_dock_cold_rebar_mode)); then
+            pass "${DOCK_DISPLAY_NAME} was optional and absent at cold boot; its empty PCIe port is safely quarantined until reboot"
+        elif ((dynamic_rebar_mode)); then
+            warn "${DOCK_DISPLAY_NAME} PCIe/Ethernet hot-add is disabled for this no-dock dynamic-ReBAR boot; reboot with the dock attached for full function"
         fi
     fi
 else

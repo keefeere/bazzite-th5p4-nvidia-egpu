@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOAD_SCRIPT="${SCRIPT_DIR}/egpu-load-nvidia-gen3.sh"
 LOCAL_RESERVE_SCRIPT="${SCRIPT_DIR}/egpu-local-reserve-apply.sh"
 LOCAL_COLD_HP_REBUILD="${SCRIPT_DIR}/egpu-cold-hp-pci-rebuild.sh"
-LOCAL_COLD_HP_DYNAMIC_REBAR="${SCRIPT_DIR}/egpu-cold-hp-dynamic-rebar.sh"
+LOCAL_COLD_DYNAMIC_REBAR="${SCRIPT_DIR}/egpu-cold-hp-dynamic-rebar.sh"
 LOCAL_RESERVE_VERIFY="${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
 LOCAL_COLD_DOCK_VERIFY="${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
 LOCAL_RESERVE_ENABLE="/etc/egpu-nvidia/enable-local-reserve"
@@ -186,7 +186,7 @@ if [[ -e ${LOCAL_RESERVE_ENABLE} ]]; then
                 if [[ ${kernel_compat_mode} == hotplug-size ]]; then
                     run_local_reserve_step \
                         "cold-attached dock dynamic ReBAR repair" \
-                        env EGPU_DYNAMIC_REBAR_BOOT_CONTEXT=1 "${LOCAL_COLD_HP_DYNAMIC_REBAR}"
+                        env EGPU_DYNAMIC_REBAR_BOOT_CONTEXT=1 "${LOCAL_COLD_DYNAMIC_REBAR}"
                 else
                     run_local_reserve_step "cold-attached dock PCI rebuild" "${LOCAL_COLD_HP_REBUILD}"
                 fi
@@ -207,7 +207,13 @@ if [[ -e ${LOCAL_RESERVE_ENABLE} ]]; then
                 fi
             fi
         else
-            run_local_reserve_step "local reserve apply" "${LOCAL_RESERVE_SCRIPT}"
+            if [[ ${kernel_compat_mode} == hotplug-size ]]; then
+                run_local_reserve_step \
+                    "no-dock cold-boot dynamic ReBAR repair" \
+                    env EGPU_DYNAMIC_REBAR_BOOT_CONTEXT=1 "${LOCAL_COLD_DYNAMIC_REBAR}"
+            else
+                run_local_reserve_step "local reserve apply" "${LOCAL_RESERVE_SCRIPT}"
+            fi
         fi
         resolve_egpu_topology
     fi

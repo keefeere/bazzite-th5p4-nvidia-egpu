@@ -78,6 +78,16 @@ first to authorize the replacement tunnel; the bounded endpoint wait then
 runs before Cardwire and the display manager. This avoids an ordering deadlock
 without changing the older-kernel path.
 
+The Linux 7.2 early ReBAR repair supports both validated cold-boot layouts.
+With the downstream HP Dock present it preserves that exact PCI branch and
+temporarily releases only the two empty TH5P4 ports. With the optional dock
+absent, all three downstream ports must be empty and match the profile before
+they are temporarily released. Both paths request the full 16 GiB RTX BAR1,
+restore and verify the local bus map, and only then allow NVIDIA to bind. The
+no-dock rebuild quarantines `pciehp` on the empty HP-facing port until reboot,
+because its rebuilt I/O window is too small for safe PCIe dock hot-add; the
+eGPU and enclosure USB remain fully available.
+
 The installer records ownership only when it adds the exact
 32 MiB sizing argument itself. A rerun after booting an older kernel removes
 that project-owned argument and restores the legacy behavior. The installer
@@ -250,6 +260,8 @@ sudo /etc/egpu-nvidia/disable-egpu-gen4.sh
 - warm host reboot with the complete chain left powered and connected;
 - host-only shutdown/power-on while enclosure and dock remain powered;
 - full cold boot with the complete enclosure and dock chain already attached;
+- full cold boot with TH5P4 and RTX attached while the optional HP Dock is
+  absent;
 - safe release and physical unplug, with a reboot required before reuse;
 - same-cable detach and reattach without physically removing the USB4 cable.
 

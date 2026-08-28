@@ -4,9 +4,11 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 APPLIED_MARKER="/run/egpu-local-reserve-applied"
 DYNAMIC_REBAR_MARKER_TEXT="TH5P4 late-hotplug dynamic ReBAR repair is active."
+NO_DOCK_COLD_REBAR_MARKER_TEXT="TH5P4 no-dock cold-boot dynamic ReBAR repair is active."
 dynamic_rebar_mode=${EGPU_ALLOW_DYNAMIC_REBAR:-0}
 if [[ -s ${APPLIED_MARKER} ]] &&
-   grep -Fqx -- "${DYNAMIC_REBAR_MARKER_TEXT}" "${APPLIED_MARKER}"; then
+   { grep -Fqx -- "${DYNAMIC_REBAR_MARKER_TEXT}" "${APPLIED_MARKER}" ||
+     grep -Fqx -- "${NO_DOCK_COLD_REBAR_MARKER_TEXT}" "${APPLIED_MARKER}"; }; then
     dynamic_rebar_mode=1
 fi
 

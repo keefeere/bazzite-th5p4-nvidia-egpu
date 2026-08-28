@@ -257,6 +257,7 @@ systemctl mask --now ublue-nvctk-cdi.service
 echo
 echo "Final NVIDIA eGPU stack installed for: ${PROFILE_NAME}"
 echo "  - local ${ENCLOSURE_DISPLAY_NAME} bus/window reservation: enabled"
+echo "  - Linux 7.2 no-dock cold-boot ReBAR repair: enabled"
 if [[ ${HP_DOCK_SUPPORT} == 1 ]]; then
     echo "  - cold-attached ${DOCK_DISPLAY_NAME} PCI-only rebuild: enabled"
 fi

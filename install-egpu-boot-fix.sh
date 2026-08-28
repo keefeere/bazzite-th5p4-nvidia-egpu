@@ -216,5 +216,6 @@ echo "It stages ${EGPU_DISPLAY_NAME} after ${ENCLOSURE_DISPLAY_NAME} appears and
 if [[ ${HP_DOCK_SUPPORT} == 1 ]]; then
     echo "A cold-attached ${DOCK_DISPLAY_NAME} keeps its USB4 router authorized while only its exact PCI subtree is rebuilt."
 fi
+echo "On Linux 7.2+, a cold boot without the optional downstream dock uses a guarded three-empty-port ReBAR repair."
 echo "Thunderbolt deauthorization is never used. The KWin eGPU pin is removed automatically when the eGPU is absent."
 echo "Installed the NVIDIA eGPU System Tray widget and its exact detach/reattach Polkit rule."

@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ ${EUID} -ne 0 ]]; then
+dry_run=0
+case ${1:-} in
+    "") ;;
+    --dry-run) dry_run=1; shift ;;
+    *) echo "Usage: $0 [--dry-run]" >&2; exit 2 ;;
+esac
+[[ $# == 0 ]] || { echo "Usage: $0 [--dry-run]" >&2; exit 2; }
+
+if [[ ${EUID} -ne 0 && ${dry_run} == 0 ]]; then
     echo "Run this script as root." >&2
     exit 1
 fi
@@ -9,7 +17,9 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 APPLIED_MARKER="/run/egpu-local-reserve-applied"
 REBOOT_MARKER="/run/egpu-nvidia-reboot-required"
+PCIEHP_QUARANTINE_MARKER="/run/egpu-pciehp-quarantined"
 ports_removed=0
+dock_attached=0
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
@@ -17,7 +27,7 @@ source "${SCRIPT_DIR}/egpu-pci-lib.sh"
 source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
 
 die() {
-    echo "COLD HP DYNAMIC REBAR FAILED: $*" >&2
+    echo "COLD DYNAMIC REBAR FAILED: $*" >&2
     exit 1
 }
 
@@ -43,6 +53,28 @@ pci_branch_has_descendants() {
     return 1
 }
 
+quarantine_empty_dock_port() {
+    local dock_port="${EXPECTED_GPU_BRIDGE_BDF%:*}:01.0"
+    local service="${dock_port}:pcie204"
+    local service_path="/sys/bus/pci_express/devices/${service}"
+    local driver
+
+    [[ -d ${service_path} ]] ||
+        die "cannot quarantine the empty ${DOCK_DISPLAY_NAME} port: ${service} is absent"
+    driver=$(basename -- "$(readlink -f "${service_path}/driver" 2>/dev/null || true)")
+    [[ ${driver} == pciehp ]] ||
+        die "cannot quarantine ${service}: expected pciehp, found ${driver:-no driver}"
+
+    echo "Disabling PCIe hot-add only on the undersized empty ${DOCK_DISPLAY_NAME} port until reboot..."
+    echo "${service}" > /sys/bus/pci_express/drivers/pciehp/unbind
+    [[ ! -L ${service_path}/driver ]] ||
+        die "the exact ${DOCK_DISPLAY_NAME} pciehp service did not release"
+    printf '%s\n' \
+        "Linux 7.2 no-dock cold ReBAR mode: ${service} is detached from pciehp." \
+        "Downstream PCIe hot-add is disabled until reboot; enclosure USB remains available." \
+        > "${PCIEHP_QUARANTINE_MARKER}"
+}
+
 recover_on_error() {
     local rc=$?
 
@@ -54,14 +86,18 @@ recover_on_error() {
     fi
     exit "${rc}"
 }
-trap recover_on_error EXIT
+if (( ! dry_run )); then
+    trap recover_on_error EXIT
+fi
 
-[[ ${EGPU_DYNAMIC_REBAR_BOOT_CONTEXT:-0} == 1 ]] ||
-    die "refusing PCI mutation outside the controlled pre-NVIDIA boot path"
+if (( ! dry_run )); then
+    [[ ${EGPU_DYNAMIC_REBAR_BOOT_CONTEXT:-0} == 1 ]] ||
+        die "refusing PCI mutation outside the controlled pre-NVIDIA boot path"
+    systemctl is-active --quiet display-manager.service &&
+        die "the display manager is already active"
+fi
 [[ $(egpu_kernel_compat_mode "$(uname -r)") == hotplug-size ]] ||
     die "this path is restricted to Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+"
-systemctl is-active --quiet display-manager.service &&
-    die "the display manager is already active"
 grep -q '^nvidia ' /proc/modules && die "NVIDIA is already loaded"
 [[ -r /sys/module/thunderbolt/parameters/host_reset &&
    $(< /sys/module/thunderbolt/parameters/host_reset) == Y ]] ||
@@ -69,17 +105,27 @@ grep -q '^nvidia ' /proc/modules && die "NVIDIA is already loaded"
 
 resolve_egpu_topology
 validate_expected_topology || die "live BDF layout differs from the configured profile"
-[[ ${HP_DOCK_SUPPORT} == 1 ]] || die "downstream dock support is disabled"
-hp_dock_router_present || die "the exact ${DOCK_DISPLAY_NAME} router is absent"
-
-# This read-only helper validates the exact HP router, bridge count, NIC
-# identity and ancestry. It deliberately performs no removal in dry-run mode.
-"${SCRIPT_DIR}/egpu-cold-hp-pci-rebuild.sh" --dry-run
 
 bridge_prefix=${EXPECTED_GPU_BRIDGE_BDF%:*}
+PORT1="${bridge_prefix}:01.0"
 PORT2="${bridge_prefix}:02.0"
 PORT3="${bridge_prefix}:03.0"
-for port in "${PORT2}" "${PORT3}"; do
+empty_ports=("${PORT1}" "${PORT2}" "${PORT3}")
+
+if hp_dock_router_present; then
+    [[ ${HP_DOCK_SUPPORT} == 1 ]] ||
+        die "an unconfigured downstream Thunderbolt router is present"
+    hp_pci_subtree_present ||
+        die "${DOCK_DISPLAY_NAME} router is present but its exact PCI subtree is incomplete"
+
+    # This read-only helper validates the exact HP router, bridge count, NIC
+    # identity and ancestry. It deliberately performs no removal in dry-run.
+    "${SCRIPT_DIR}/egpu-cold-hp-pci-rebuild.sh" --dry-run
+    dock_attached=1
+    empty_ports=("${PORT2}" "${PORT3}")
+fi
+
+for port in "${empty_ports[@]}"; do
     [[ $(pci_id_at "${port}" 2>/dev/null || true) == "${TH5P4_VENDOR}:${TH5P4_DEVICE}" ]] ||
         die "expected empty TH5P4 sibling ${port} is absent or changed"
     ! pci_branch_has_descendants "${port}" ||
@@ -97,9 +143,15 @@ done
 read -r root_io_start root_io_end root_io_flags < <(
     sed -n '14p' "/sys/bus/pci/devices/${EXPECTED_USB4_ROOT_PORT_BDF}/resource"
 )
-((root_io_flags != 0 && root_io_end >= root_io_start &&
-  root_io_end - root_io_start + 1 >= 32 * 1024)) ||
-    die "the reassigned USB4 root I/O aperture is smaller than 32 KiB"
+if ((dock_attached)); then
+    ((root_io_flags != 0 && root_io_end >= root_io_start &&
+      root_io_end - root_io_start + 1 >= 32 * 1024)) ||
+        die "the reassigned USB4 root I/O aperture is smaller than 32 KiB"
+else
+    ((root_io_flags != 0 && root_io_start == ROOT_IO_START &&
+      root_io_end == ROOT_IO_END)) ||
+        die "the no-dock USB4 root I/O aperture differs from the profile"
+fi
 read -r root_mmio_start root_mmio_end root_mmio_flags < <(
     sed -n '15p' "/sys/bus/pci/devices/${EXPECTED_USB4_ROOT_PORT_BDF}/resource"
 )
@@ -122,9 +174,31 @@ gpu_secondary=$(< "/sys/bus/pci/devices/${EXPECTED_GPU_BRIDGE_BDF}/secondary_bus
     die "the TH5P4 bus ranges differ from the profile"
 
 bar1_size=$(pci_resource_size "${EXPECTED_GPU_BDF}" 1)
+if ((dry_run)); then
+    if [[ ${bar1_size} == $((256 * 1024 * 1024)) ]]; then
+        resize_mask=$(< "/sys/bus/pci/devices/${EXPECTED_GPU_BDF}/resource1_resize")
+        (((16#${resize_mask}) & (1 << 14))) ||
+            die "the RTX does not advertise a 16 GiB BAR1 size"
+    elif [[ ${bar1_size} != "${EGPU_BAR1_SIZE}" ]]; then
+        die "RTX BAR1 is neither the validated 256 MiB input nor 16 GiB result"
+    fi
+    printf '%s\n' \
+        "COLD DYNAMIC REBAR PREFLIGHT PASSED (read-only; nothing was changed)." \
+        "  Downstream dock present: $([[ ${dock_attached} == 1 ]] && echo yes || echo no)" \
+        "  Validated empty TH5P4 ports: ${#empty_ports[@]}" \
+        "  RTX BAR1 input: $((bar1_size / 1024 / 1024)) MiB; 16 GiB resize capability is available."
+    exit 0
+fi
+
 if [[ ${bar1_size} == "${EGPU_BAR1_SIZE}" ]]; then
-    echo "The complete 16 GiB RTX BAR1 is already present; validating the preserved HP branch..."
-    "${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
+    if ((dock_attached)); then
+        echo "The complete 16 GiB RTX BAR1 is already present; validating the preserved HP branch..."
+        "${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
+    else
+        echo "The complete 16 GiB RTX BAR1 is already present; validating the no-dock reserve..."
+        EGPU_ALLOW_DYNAMIC_REBAR=1 "${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
+        quarantine_empty_dock_port
+    fi
 elif [[ ${bar1_size} == $((256 * 1024 * 1024)) ]]; then
     resize_mask=$(< "/sys/bus/pci/devices/${EXPECTED_GPU_BDF}/resource1_resize")
     (((16#${resize_mask}) & (1 << 14))) ||
@@ -137,47 +211,76 @@ elif [[ ${bar1_size} == $((256 * 1024 * 1024)) ]]; then
         die "RTX audio is unexpectedly bound to ${audio_driver}"
     fi
 
-    echo "Preserving ${DOCK_DISPLAY_NAME} and releasing only two empty TH5P4 sibling ports..."
-    echo 1 > "/sys/bus/pci/devices/${PORT2}/remove"
-    echo 1 > "/sys/bus/pci/devices/${PORT3}/remove"
+    if ((dock_attached)); then
+        echo "Preserving ${DOCK_DISPLAY_NAME} and releasing only two empty TH5P4 sibling ports..."
+    else
+        echo "No downstream dock is attached; releasing all three validated empty TH5P4 ports..."
+    fi
+    for port in "${empty_ports[@]}"; do
+        echo 1 > "/sys/bus/pci/devices/${port}/remove"
+    done
     ports_removed=1
     for _ in {1..50}; do
-        [[ ! -d /sys/bus/pci/devices/${PORT2} &&
-           ! -d /sys/bus/pci/devices/${PORT3} ]] && break
+        all_removed=1
+        for port in "${empty_ports[@]}"; do
+            [[ ! -d /sys/bus/pci/devices/${port} ]] || all_removed=0
+        done
+        ((all_removed)) && break
         sleep 0.1
     done
-    [[ ! -d /sys/bus/pci/devices/${PORT2} &&
-       ! -d /sys/bus/pci/devices/${PORT3} ]] ||
-        die "the empty sibling ports did not leave the PCI model"
+    for port in "${empty_ports[@]}"; do
+        [[ ! -d /sys/bus/pci/devices/${port} ]] ||
+            die "empty sibling ${port} did not leave the PCI model"
+    done
 
     echo "Requesting 16 GiB RTX BAR1 through Linux resource1_resize..."
     echo 14 > "/sys/bus/pci/devices/${EXPECTED_GPU_BDF}/resource1_resize"
     [[ $(pci_resource_size "${EXPECTED_GPU_BDF}" 1) == "${EGPU_BAR1_SIZE}" ]] ||
         die "the kernel did not assign the required 16 GiB RTX BAR1"
 
-    echo "Returning the two empty TH5P4 sibling ports..."
+    echo "Returning the validated empty TH5P4 sibling ports..."
     echo 1 > "/sys/bus/pci/devices/${EXPECTED_TH5P4_UPSTREAM_BDF}/rescan"
     for _ in {1..50}; do
-        [[ -d /sys/bus/pci/devices/${PORT2} &&
-           -d /sys/bus/pci/devices/${PORT3} ]] && break
+        all_present=1
+        for port in "${empty_ports[@]}"; do
+            [[ -d /sys/bus/pci/devices/${port} ]] || all_present=0
+        done
+        ((all_present)) && break
         sleep 0.1
     done
-    [[ -d /sys/bus/pci/devices/${PORT2} &&
-       -d /sys/bus/pci/devices/${PORT3} ]] ||
-        die "the empty sibling ports did not return"
+    for port in "${empty_ports[@]}"; do
+        [[ -d /sys/bus/pci/devices/${port} ]] ||
+            die "empty sibling ${port} did not return"
+    done
     ports_removed=0
 
     resolve_egpu_topology
     validate_expected_topology || die "the exact topology changed after ReBAR resize"
-    "${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
+    if ((dock_attached)); then
+        "${SCRIPT_DIR}/egpu-cold-attached-hp-verify.sh"
+    else
+        EGPU_ALLOW_DYNAMIC_REBAR=1 "${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
+        quarantine_empty_dock_port
+    fi
 else
     die "RTX BAR1 is neither the validated 256 MiB input nor 16 GiB result"
 fi
 
-printf '%s\n' \
-    "TH5P4 cold-dock dynamic ReBAR repair is active." \
-    "The kernel resized RTX BAR1 to 16 GiB while preserving the validated HP PCI branch." \
-    > "${APPLIED_MARKER}"
+if ((dock_attached)); then
+    printf '%s\n' \
+        "TH5P4 cold-dock dynamic ReBAR repair is active." \
+        "The kernel resized RTX BAR1 to 16 GiB while preserving the validated HP PCI branch." \
+        > "${APPLIED_MARKER}"
+else
+    printf '%s\n' \
+        "TH5P4 no-dock cold-boot dynamic ReBAR repair is active." \
+        "The kernel resized RTX BAR1 to 16 GiB before NVIDIA was allowed to bind." \
+        > "${APPLIED_MARKER}"
+fi
 rm -f -- "${REBOOT_MARKER}"
 trap - EXIT
-echo "The guarded cold-dock ReBAR transition passed before NVIDIA was allowed to bind."
+if ((dock_attached)); then
+    echo "The guarded cold-dock ReBAR transition passed before NVIDIA was allowed to bind."
+else
+    echo "The guarded no-dock ReBAR transition passed before NVIDIA was allowed to bind."
+fi
