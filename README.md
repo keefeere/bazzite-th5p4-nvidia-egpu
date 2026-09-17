@@ -204,17 +204,20 @@ reboot. While the cable has never been removed, the existing **Connect eGPU**
 action may still reverse a same-cable detach through its separately validated
 RTX-port rescan.
 
-A fresh physical hot-plug after an AMD-only graphical boot is not a supported
-production flow on Linux 7.2. The automatic add event deliberately leaves the
-endpoint driverless and asks for a reboot rather than ending the current
-session or mutating live PCI resources. `egpu-nvidia-hot-attach.service`
-retains a guarded diagnostic ReBAR experiment for development: it validates
-the exact driver-free 256 MiB input state, can preserve the configured HP Dock
-branch, ends the graphical session and requests a 16 GiB BAR1 through the
-kernel's `resource1_resize` interface. It is not exposed by the tray after a
-physical hot-plug and is not part of the supported lifecycle contract.
+A fresh physical hot-plug after an AMD-only graphical boot is never activated
+automatically. On Linux 7.2+ the add event deliberately leaves the endpoint
+driverless so connecting a cable cannot unexpectedly end the current session
+or mutate live PCI resources. When the exact configured topology appears with
+the validated driver-free 256 MiB BAR1 state, the tray offers **Connect eGPU**
+as an explicit guarded action. It preserves the configured HP Dock branch,
+ends the graphical session, requests a 16 GiB BAR1 through the kernel's
+`resource1_resize` interface and starts a new NVIDIA-first session at
+conservative Gen3. The service validates every precondition again and fails
+closed to the AMD login screen. Older kernels, a changed topology, stale
+reserve state and a cable replug after completed safe-detach continue to
+require a reboot.
 
-When the diagnostic repair runs without the HP Dock, the 7.2 allocator leaves
+When the live repair runs without the HP Dock, the 7.2 allocator leaves
 only 4 KiB of I/O on each empty downstream port, less than the complete HP Dock
 PCI tree was validated with. The repair therefore unbinds `pciehp` only from
 the exact HP-facing port until reboot. NVIDIA outputs and enclosure USB remain
@@ -263,11 +266,14 @@ sudo /etc/egpu-nvidia/disable-egpu-gen4.sh
 - full cold boot with TH5P4 and RTX attached while the optional HP Dock is
   absent;
 - safe release and physical unplug, with a reboot required before reuse;
-- same-cable detach and reattach without physically removing the USB4 cable.
+- same-cable detach and reattach without physically removing the USB4 cable;
+- guarded first physical hot-attach on Linux 7.2+ through the explicit tray
+  action, with a session restart and conservative Gen3 link.
 
-Fresh physical eGPU hot-attach, same-boot replug after cable removal and
-hot-adding the complete downstream PCIe dock are outside the supported
-production lifecycle. Boot with the required chain already connected.
+Automatic physical eGPU activation, same-boot replug after cable removal and
+hot-adding the complete downstream PCIe dock remain outside the supported
+production lifecycle. Boot with the required chain already connected unless
+the tray explicitly offers the guarded first-hotplug action.
 
 A rare full-chain power-cycle can leave only the configured enclosure's USB
 diagnostic function visible while its USB4/PCIe router and GPU never enumerate.

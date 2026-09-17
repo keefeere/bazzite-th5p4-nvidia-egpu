@@ -14,6 +14,8 @@ RELEASED_UNPLUGGED_MARKER="/run/egpu-nvidia-released-unplugged"
 
 # shellcheck source=egpu-pci-lib.sh
 source "${SCRIPT_DIR}/egpu-pci-lib.sh"
+# shellcheck source=egpu-kernel-compat.sh
+source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
 
 locale_name="${LC_ALL:-${LC_MESSAGES:-${LANG:-en}}}"
 case ${1:-auto} in
@@ -102,6 +104,29 @@ if [[ -s ${LOCAL_RESERVE_FAILURE_MARKER} ]]; then
     emit error \
         "$(tr "PCI reserve failed" "Помилка резервування PCI")" \
         "$(tr "NVIDIA stayed blocked. Check egpu-nvidia-boot.service, correct the kernel compatibility state, then reboot." "NVIDIA лишилася заблокованою. Перевір egpu-nvidia-boot.service, виправ стан сумісності ядра та перезавантаж систему.")"
+fi
+
+# Linux 7.2+ can repair one narrowly validated first physical hot-plug while
+# the RTX is still driver-free with its firmware-sized 256 MiB BAR1. Never do
+# this automatically: activating NVIDIA ends the current graphical session.
+# Expose the guarded service as an explicit action only when its immutable
+# preconditions are visible here. The service validates them again.
+if [[ -s ${PENDING_MARKER} && -e ${REBOOT_MARKER} &&
+      ! -s ${RELEASED_UNPLUGGED_MARKER} &&
+      ! -s ${SAFE_MARKER} && ! -e ${DETACH_BLOCK_MARKER} ]] &&
+   resolve_egpu_gpu &&
+   ! grep -q '^nvidia ' /proc/modules; then
+    compat_mode=$(egpu_kernel_compat_mode "$(uname -r)" 2>/dev/null || true)
+    bar1_size=$(stat -Lc %s "/sys/bus/pci/devices/${GPU}/resource1" 2>/dev/null || true)
+    host_reset=$(cat /sys/module/thunderbolt/parameters/host_reset 2>/dev/null || true)
+    if [[ ${compat_mode} == hotplug-size &&
+          ${bar1_size} == 268435456 &&
+          ${host_reset} == Y &&
+          ! -s /run/egpu-local-reserve-applied ]]; then
+        emit hotplug \
+            "$(tr "eGPU detected — connection available" "eGPU знайдена — можна підключити")" \
+            "$(tr "A guarded live PCI repair is available. Click Connect eGPU; the current graphical session will end and NVIDIA will start at conservative Gen3." "Доступне контрольоване live-відновлення PCI. Натисни «Підключити eGPU»: поточний графічний сеанс завершиться, а NVIDIA запуститься у консервативному Gen3.")"
+    fi
 fi
 
 if [[ -s ${PENDING_MARKER} && -e ${REBOOT_MARKER} ]]; then

@@ -30,7 +30,7 @@ PlasmoidItem {
     property string commandError: ""
 
     readonly property bool canDetach: egpuState === "ready"
-    readonly property bool canAttach: egpuState === "safe" || egpuState === "reattach" || egpuState === "present"
+    readonly property bool canAttach: egpuState === "safe" || egpuState === "reattach" || egpuState === "present" || egpuState === "hotplug"
     readonly property bool isBusy: egpuState === "detaching" || egpuState === "attaching" || egpuState === "initializing"
 
     Plasmoid.icon: (egpuState === "safe" || egpuState === "unplugged") ? "media-eject" :
@@ -67,7 +67,7 @@ PlasmoidItem {
         stateTitle = fields[1];
         stateDetail = fields.slice(2).join(" ");
         if (egpuState !== "ready") {
-            if (egpuState !== "safe" && egpuState !== "reattach" && egpuState !== "present") {
+            if (egpuState !== "safe" && egpuState !== "reattach" && egpuState !== "present" && egpuState !== "hotplug") {
                 confirmationAction = "";
             }
         }
