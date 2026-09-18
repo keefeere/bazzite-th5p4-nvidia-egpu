@@ -122,7 +122,10 @@ fi
 
 resolve_egpu_topology
 
-if [[ -e ${LOCAL_RESERVE_ENABLE} ]]; then
+if egpu_cmdline_has_arg "$(</proc/cmdline)" "${EGPU_TB_HOST_RESET_NODOCK_KARG}"; then
+    run_local_reserve_step "no-dock existing-resource A/B validation" \
+        "${SCRIPT_DIR}/egpu-host-reset-nodock.sh" --prepare
+elif [[ -e ${LOCAL_RESERVE_ENABLE} ]]; then
     kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)") || {
         record_local_reserve_failure "kernel release parsing" 1 || true
         echo "Unsupported kernel release format: $(uname -r)" >&2

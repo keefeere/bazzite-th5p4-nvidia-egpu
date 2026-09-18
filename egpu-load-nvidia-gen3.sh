@@ -45,7 +45,9 @@ echo "[1/8] Fixing the eGPU PCIe link at ${generation_label} x4..."
 
 echo "[2/8] Loading the NVIDIA core module only..."
 nvidia_module_options=()
-if egpu_nvidia_host_has_contiguous_policy; then
+if egpu_nvidia_skip_contiguous_policy_this_boot; then
+    echo "One-shot suspend diagnostic: omitting RMDisableNoncontigAlloc for this boot only."
+elif egpu_nvidia_host_has_contiguous_policy; then
     nvidia_module_options+=("${EGPU_NVIDIA_CONTIGUOUS_POLICY}")
     echo "Mirroring the active Bazzite contiguous-allocation policy for Gamescope scanout."
 fi

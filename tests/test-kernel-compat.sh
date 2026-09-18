@@ -101,5 +101,34 @@ else
     failures=$((failures + 1))
 fi
 
+test_cmdline='quiet thunderbolt.host_reset=0 egpu.host_reset_test=1'
+if egpu_host_reset_test_active "${test_cmdline}" N &&
+   ! egpu_host_reset_test_active "${test_cmdline}" Y &&
+   ! egpu_host_reset_test_active "${test_cmdline}" '' &&
+   ! egpu_host_reset_test_active 'thunderbolt.host_reset=0' N &&
+   ! egpu_host_reset_test_active 'egpu.host_reset_test=1' N &&
+   ! egpu_host_reset_test_active "${test_cmdline} thunderbolt.host_reset=1" N &&
+   ! egpu_host_reset_test_active "${test_cmdline} thunderbolt.host_reset=0" N &&
+   ! egpu_host_reset_test_active "${test_cmdline} egpu.host_reset_test=0" N &&
+   ! egpu_host_reset_test_active "${test_cmdline} egpu.host_reset_test=1" N &&
+   ! egpu_host_reset_test_active 'foo=thunderbolt.host_reset=0 egpu.host_reset_test=1' N; then
+    printf 'PASS  host-reset A/B requires exact unique arguments and actual N\n'
+else
+    printf 'FAIL  host-reset A/B authorization\n' >&2
+    failures=$((failures + 1))
+fi
+
+nodock_cmdline="${test_cmdline} egpu.host_reset_nodock=1"
+if egpu_host_reset_nodock_test_active "${nodock_cmdline}" N &&
+   ! egpu_host_reset_nodock_test_active "${nodock_cmdline}" Y &&
+   ! egpu_host_reset_nodock_test_active "${test_cmdline}" N &&
+   ! egpu_host_reset_nodock_test_active 'egpu.host_reset_nodock=1' N &&
+   ! egpu_host_reset_nodock_test_active "${nodock_cmdline} egpu.host_reset_nodock=1" N &&
+   ! egpu_host_reset_nodock_test_active "${nodock_cmdline} egpu.host_reset_nodock=0" N; then
+    printf 'PASS  no-dock A/B requires its own exact unique boot marker\n'
+else
+    printf 'FAIL  no-dock A/B authorization\n' >&2
+    failures=$((failures + 1))
+fi
 printf '\nKernel compatibility tests complete: %d failure(s).\n' "${failures}"
 (( failures == 0 ))

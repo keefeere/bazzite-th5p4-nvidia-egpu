@@ -99,9 +99,12 @@ fi
 [[ $(egpu_kernel_compat_mode "$(uname -r)") == hotplug-size ]] ||
     die "this path is restricted to Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+"
 grep -q '^nvidia ' /proc/modules && die "NVIDIA is already loaded"
-[[ -r /sys/module/thunderbolt/parameters/host_reset &&
-   $(< /sys/module/thunderbolt/parameters/host_reset) == Y ]] ||
-    die "the tested upstream USB4 host reset is not active"
+host_reset=$(cat /sys/module/thunderbolt/parameters/host_reset 2>/dev/null || true)
+if egpu_host_reset_test_active "$(</proc/cmdline)" "${host_reset}"; then
+    echo "EXPERIMENTAL host_reset=0 A/B boot: retaining all PCI/ReBAR safety checks."
+elif [[ ${host_reset} != Y ]]; then
+    die "the tested upstream USB4 host reset is not active (no explicit A/B boot)"
+fi
 
 resolve_egpu_topology
 validate_expected_topology || die "live BDF layout differs from the configured profile"

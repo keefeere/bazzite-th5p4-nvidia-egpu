@@ -79,5 +79,24 @@ expect_live_miss \
     'RegistryDwords: ""' \
     'empty live RegistryDwords is rejected'
 
+policy_tmp=$(mktemp -d)
+EGPU_NVIDIA_POLICY_SKIP_ONCE="${policy_tmp}/etc/skip-once"
+EGPU_NVIDIA_POLICY_SKIP_ACTIVE="${policy_tmp}/run/skip-active"
+install -D -m 0644 /dev/null "${EGPU_NVIDIA_POLICY_SKIP_ONCE}"
+if egpu_nvidia_skip_contiguous_policy_this_boot &&
+   [[ ! -e ${EGPU_NVIDIA_POLICY_SKIP_ONCE} && -e ${EGPU_NVIDIA_POLICY_SKIP_ACTIVE} ]]; then
+    printf 'PASS  one-shot policy latch is consumed into the boot marker\n'
+else
+    printf 'FAIL  one-shot policy latch was not consumed correctly\n' >&2
+    failures=$((failures + 1))
+fi
+if egpu_nvidia_skip_contiguous_policy_this_boot; then
+    printf 'PASS  boot marker keeps policy omitted for controlled loader retries\n'
+else
+    printf 'FAIL  boot marker did not retain the diagnostic policy\n' >&2
+    failures=$((failures + 1))
+fi
+rm -rf -- "${policy_tmp}"
+
 printf '\nNVIDIA policy tests complete: %d failure(s).\n' "${failures}"
 (( failures == 0 ))

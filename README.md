@@ -107,6 +107,20 @@ older deployments. The verifier checks both the host request and the live
 `RegistryDwords` value; changing this policy requires a reboot before the live
 check can pass.
 
+For a suspend-allocation A/B diagnostic, the installed
+`egpu-arm-suspend-policy-test.sh` can arm one boot which omits only
+`RMDisableNoncontigAlloc=1` from the controlled NVIDIA load. The latch is
+consumed before module loading and represented by a `/run` marker for the rest
+of that boot, so retries cannot silently change policy. The following reboot
+automatically restores the deployment policy. This diagnostic can reintroduce
+the Gamescope scanout corruption that the Bazzite option prevents:
+
+```bash
+sudo /etc/egpu-nvidia/egpu-arm-suspend-policy-test.sh arm
+# Historical diagnostic; this did not fix suspend on the tested machine.
+sudo /etc/egpu-nvidia/egpu-arm-suspend-policy-test.sh cancel  # cancel before reboot
+```
+
 ## Install the bundled profile
 
 From this directory:
@@ -282,6 +296,122 @@ NVIDIA, so the scripts do not attempt a risky reset. Fully remove enclosure/GPU
 power, allow its capacitors to discharge, bring it up without the downstream
 dock, connect the host, then reconnect the dock. The tray reports the state and
 recovery requirement in the selected language.
+
+## Optional temporary sleep guard
+
+Suspend/resume with this enclosure is not validated. To refuse sleep while the
+profiled GPU or TH5P4 enclosure is detected:
+
+```bash
+sudo ./install-egpu-sleep-guard.sh
+```
+
+This takes effect immediately, without rebooting or reloading NVIDIA. An
+`ExecStartPre` check prevents `systemd-sleep` from running for suspend,
+hibernate, hybrid sleep and suspend-then-hibernate. Screen locking and other
+preparatory services can still run; a blocked attempt reports a service failure.
+Display blanking, shutdown and reboot are unaffected. This covers the standard
+systemd sleep services, not direct root writes to the kernel power interface.
+
+Logical detach alone does not unblock sleep: the enclosure's Thunderbolt router
+or USB diagnostic function also counts as present. After safe physical unplug,
+the next sleep attempt is allowed automatically. An HP dock by itself does not
+block sleep. Unreadable/missing profile or missing sysfs buses fail closed.
+
+To inspect the decision without requesting sleep:
+
+```bash
+bash /etc/egpu-nvidia/egpu-sleep-guard.sh
+sudo journalctl -b -u systemd-suspend.service -n 30
+```
+
+To remove only this temporary guard (no reboot required):
+
+```bash
+sudo ./remove-egpu-sleep-guard.sh
+```
+
+Full stack rollback also removes these drop-ins. The guard is deliberately
+opt-in and is not automatically enabled by the main installer.
+
+Direct invocation of the guard is read-only. The diagnostic exception described
+below is consumed only by `systemd-suspend.service`, never by hibernate, hybrid
+sleep, suspend-then-hibernate or a manual status check. Reinstall the optional
+guard to migrate older drop-ins to this unit-scoped form.
+
+## Explicit USB4 host-reset sleep experiment (7.2+ only)
+
+**Diagnostic history, not a working suspend fix.** The no-dock experiment
+booted successfully but its `platform` test still hung on 2026-09-18. See the
+[results and remaining hypotheses](diagnostics/2026-09-18-suspend-status.md).
+
+`sudo ./egpu-host-reset-test.sh arm` stages `thunderbolt.host_reset=0` with
+`egpu.host_reset_test=1`, after refusing pending deployments and existing reset
+overrides. It backs up and installs only the diagnostic-aware helpers.
+The cold-boot ReBAR path accepts this exception only with both exact arguments
+and an actual `host_reset=N`; all topology, driver and resource checks remain.
+The verifier reports a diagnostic warning rather than treating it as production.
+Legacy kernel policy and the main installer's normal policy are unchanged.
+
+Reboot with the same powered chain attached. Check `nvidia-smi -L`, the full
+verifier and `./egpu-host-reset-test.sh status`. Do not test hot-plug or rerun
+the main installer during this experiment. The sleep guard stays installed.
+
+This is **not an automatic one-shot**. After boot, **before any sleep test**, run
+`sudo ./egpu-host-reset-test.sh cancel` to finalize removal of the diagnostic
+arguments for the following boot. This leaves the running experiment intact
+but makes the next normal boot use the standard policy again. Confirm the
+finalization succeeded before attempting sleep. If the experimental boot fails,
+select the previous deployment in the boot menu. Do not repeat sleep tests or
+disable the guard until the graphics and rollback state have been checked.
+
+`cancel` removes no unmarked reset setting and does not replace the helper
+files: their inactive diagnostic branch is harmless without the boot marker.
+
+### No-dock, existing-resource variant
+
+The first `host_reset=0` trial with HP attached stopped before NVIDIA loading:
+the root I/O aperture was 16 KiB rather than the cold-dock path's required
+32 KiB, and TH5P4 had a compact `02-0c` bus range. This did not test suspend.
+
+For the isolated enclosure variant use `sudo ./egpu-host-reset-test.sh arm-nodock`.
+Then shut down XAX, physically disconnect HP from TH5P4, and boot with only
+powered TH5P4 + RTX already connected. Do not change the GPU cable or other
+power policies simultaneously. Do not attach any downstream PCIe device in
+this boot or rerun the full stack installer.
+
+This adds the separate `egpu.host_reset_nodock=1` marker. Only this variant
+bypasses the normal local reservation/ReBAR path. It requires the same exact
+GPU/audio/bridge identities and ancestry, no downstream devices, complete
+16 GiB BAR1, correctly typed/aligned BARs, nested bus/window ranges and no
+sibling resource overlap. It accepts valid compact bus ranges and existing
+addresses rather than requiring the production reservation map. It never
+resizes BARs, programs bridge windows, removes devices or rescans PCI.
+Insufficient resources leave NVIDIA blocked, with actual resources logged.
+
+Before loading NVIDIA it unbinds pciehp only on the three validated empty
+TH5P4 downstream ports, preventing PCIe hot-add until reboot. Ordinary GPU
+initialization, link staging and D0 policy remain unchanged. The read-only
+checker has synthetic-tree tests in `tests/test-existing-resources.py`.
+Physical boot succeeded on the test host; suspend did not complete.
+
+After boot check the full verifier and `nvidia-smi -L`, then run `cancel`
+**before any sleep test** to finalize the normal next boot. The sleep guard is
+not removed by this helper. If this variant cannot boot, use the previous
+deployment. If it boots only on AMD, collect
+`journalctl -b -u egpu-nvidia-boot.service` before cancellation/reboot.
+
+`cancel` also invokes OSTree's `admin finalize-staged` command and
+verifies that no staged deployment or marked reset argument remains. This is
+required before a deliberately risky suspend test: a hard power-cycle cannot
+run the normal shutdown-time `ostree-finalize-staged.service`, so merely
+staging the recovery kargs would otherwise boot the experimental deployment
+again after a hang.
+
+The explicit diagnostic runner and its hardware-free tests are now versioned
+in this repository, rather than requiring a private workspace copy. See
+[sleep-lab instructions](diagnostics/egpu-sleep-lab.md). Nothing installs or
+runs that diagnostic through the normal eGPU boot service.
 
 ## Logs and support bundle
 

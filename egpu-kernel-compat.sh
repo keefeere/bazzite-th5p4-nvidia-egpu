@@ -11,6 +11,36 @@ EGPU_PCI_HOTPLUG_KARG="pci=hpmmiosize=32M,hpmmioprefsize=32M"
 EGPU_PCI_HOTPLUG_MMIO_BYTES=$((32 * 1024 * 1024))
 EGPU_PCI_HOTPLUG_PREF_BYTES=$((32 * 1024 * 1024))
 EGPU_TB_HOST_RESET_KARG="thunderbolt.host_reset=0"
+EGPU_TB_HOST_RESET_TEST_KARG="egpu.host_reset_test=1"
+EGPU_TB_HOST_RESET_NODOCK_KARG="egpu.host_reset_nodock=1"
+
+egpu_host_reset_nodock_test_active() {
+    local cmdline=$1 actual=$2 token count=0
+    egpu_host_reset_test_active "${cmdline}" "${actual}" || return 1
+    for token in ${cmdline}; do
+        case ${token} in
+            egpu.host_reset_nodock=1) count=$((count + 1)) ;;
+            egpu.host_reset_nodock=*) return 1 ;;
+        esac
+    done
+    [[ ${count} == 1 ]]
+}
+
+# Diagnostic exception only: never relax any PCI topology/resource checks.
+# Require unambiguous boot arguments AND the actual module value.
+egpu_host_reset_test_active() {
+    local cmdline=$1 actual=$2 token resets=0 tests=0
+    [[ ${actual} == N ]] || return 1
+    for token in ${cmdline}; do
+        case ${token} in
+            thunderbolt.host_reset=0) resets=$((resets + 1)) ;;
+            thunderbolt.host_reset=*) return 1 ;;
+            egpu.host_reset_test=1) tests=$((tests + 1)) ;;
+            egpu.host_reset_test=*) return 1 ;;
+        esac
+    done
+    [[ ${resets} == 1 && ${tests} == 1 ]]
+}
 
 # Migration-only: an earlier, rejected 7.2 experiment used this argument.
 # It globally repacked the TH5P4 hierarchy at boot and must never be required.

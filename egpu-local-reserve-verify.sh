@@ -17,6 +17,10 @@ source "${SCRIPT_DIR}/egpu-pci-lib.sh"
 # shellcheck source=egpu-kernel-compat.sh
 source "${SCRIPT_DIR}/egpu-kernel-compat.sh"
 
+if egpu_cmdline_has_arg "$(</proc/cmdline)" "${EGPU_TB_HOST_RESET_NODOCK_KARG}"; then
+    exec /usr/bin/bash "${SCRIPT_DIR}/egpu-host-reset-nodock.sh" --verify
+fi
+
 kernel_compat_mode=$(egpu_kernel_compat_mode "$(uname -r)") || {
     echo "LOCAL TH5P4 RESERVE VERIFY FAILED: unsupported kernel release $(uname -r)" >&2
     exit 1

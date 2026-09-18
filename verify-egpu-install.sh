@@ -98,7 +98,9 @@ else
 fi
 
 if [[ ${kernel_compat_mode} == hotplug-size ]]; then
-    if egpu_cmdline_has_arg "${cmdline}" "${EGPU_TB_HOST_RESET_KARG}"; then
+    if egpu_host_reset_test_active "${cmdline}" "$(cat /sys/module/thunderbolt/parameters/host_reset 2>/dev/null || true)"; then
+        warn "explicit host_reset=0 suspend A/B boot; first hot-plug is not supported in this experiment"
+    elif egpu_cmdline_has_arg "${cmdline}" "${EGPU_TB_HOST_RESET_KARG}"; then
         fail "Linux ${EGPU_PCI_COMPAT_MIN_KERNEL}+ still has legacy ${EGPU_TB_HOST_RESET_KARG}; first USB4 hot-plug may fail"
     elif [[ -r /sys/module/thunderbolt/parameters/host_reset ]] &&
          [[ $(< /sys/module/thunderbolt/parameters/host_reset) == Y ]]; then
@@ -208,7 +210,16 @@ if resolve_egpu_topology 2>/dev/null; then
         fi
     done
 
-    if egpu_nvidia_host_has_contiguous_policy; then
+    if [[ -e ${EGPU_NVIDIA_POLICY_SKIP_ACTIVE} ]]; then
+        pass "one-shot suspend diagnostic omitted the Bazzite contiguous-allocation policy for this boot"
+        if grep -q '^nvidia ' /proc/modules; then
+            if egpu_nvidia_live_has_contiguous_policy; then
+                fail "one-shot diagnostic is active but NVIDIA still loaded RMDisableNoncontigAlloc=1"
+            else
+                pass "controlled NVIDIA loader omitted RMDisableNoncontigAlloc=1"
+            fi
+        fi
+    elif egpu_nvidia_host_has_contiguous_policy; then
         pass "active Bazzite profile requests contiguous NVIDIA scanout allocations"
         if grep -q '^nvidia ' /proc/modules; then
             if egpu_nvidia_live_has_contiguous_policy; then
@@ -299,7 +310,11 @@ if resolve_egpu_topology 2>/dev/null; then
     else
         topology_verify="${SCRIPT_DIR}/egpu-local-reserve-verify.sh"
         if topology_output="$("${topology_verify}" 2>&1)"; then
-            pass "local ${ENCLOSURE_DISPLAY_NAME} reservation verified"
+            if egpu_cmdline_has_arg "${cmdline}" "${EGPU_TB_HOST_RESET_NODOCK_KARG}"; then
+                pass "no-dock A/B existing PCI resources verified; no reallocation; all downstream PCIe hot-add quarantined"
+            else
+                pass "local ${ENCLOSURE_DISPLAY_NAME} reservation verified"
+            fi
         else
             fail "local-reserve verifier: ${topology_output##*$'\n'}"
         fi

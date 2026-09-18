@@ -74,11 +74,14 @@ install -m 0755 \
     "${SOURCE_DIR}/egpu-hardware-report.sh" \
     "${SOURCE_DIR}/enable-egpu-gen4.sh" \
     "${SOURCE_DIR}/disable-egpu-gen4.sh" \
+    "${SOURCE_DIR}/egpu-arm-suspend-policy-test.sh" \
     "${SOURCE_DIR}/verify-egpu-install.sh" \
     "${SOURCE_DIR}/egpu-local-reserve-preflight.sh" \
     "${SOURCE_DIR}/egpu-local-reserve-apply.sh" \
     "${SOURCE_DIR}/egpu-cold-hp-pci-rebuild.sh" \
     "${SOURCE_DIR}/egpu-cold-hp-dynamic-rebar.sh" \
+    "${SOURCE_DIR}/egpu-host-reset-nodock.sh" \
+    "${SOURCE_DIR}/egpu-existing-resources.py" \
     "${SOURCE_DIR}/egpu-local-reserve-verify.sh" \
     "${SOURCE_DIR}/egpu-cold-attached-hp-verify.sh" \
     "${SOURCE_DIR}/egpu-local-reserve-accept-live.sh" \

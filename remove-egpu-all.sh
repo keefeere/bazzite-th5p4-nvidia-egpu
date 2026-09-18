@@ -22,6 +22,9 @@ elif [[ -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
     desktop_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
 fi
 
+for action in suspend hibernate hybrid-sleep suspend-then-hibernate; do
+    rm -f -- "/etc/systemd/system/systemd-${action}.service.d/90-egpu-sleep-guard.conf"
+done
 systemctl disable --now egpu-nvidia-boot.service 2>/dev/null || true
 systemctl unmask ublue-nvctk-cdi.service 2>/dev/null || true
 rm -rf -- /etc/systemd/system/egpu-nvidia-boot.service.d
@@ -72,6 +75,8 @@ done
 kargs_command=(
     rpm-ostree kargs
     --delete-if-present="thunderbolt.host_reset=0"
+    --delete-if-present="egpu.host_reset_test=1"
+    --delete-if-present="egpu.host_reset_nodock=1"
     --delete-if-present="thunderbolt.clx=0"
 )
 if (( managed_pci_realloc )); then
