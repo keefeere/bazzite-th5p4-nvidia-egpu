@@ -164,7 +164,8 @@ class Guards(unittest.TestCase):
     def test_only_known_actions(self):
         self.assertEqual(set(trial.ACTIONS), {'--start', '--start-with-deny-probe', '--execute',
                                               '--execute-deny-probe', '--restore', '--archive-restored',
-                                              '--start-llama-role', '--execute-llama-role'})
+                                              '--start-llama-role', '--execute-llama-role',
+                                              '--start-kwin-role', '--execute-kwin-role'})
 
 
 if __name__ == '__main__':

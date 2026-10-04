@@ -32,8 +32,8 @@ PINS = Path('/sys/fs/bpf/cardwire-service-roles')
 PIN_NAMES = ('exec_link', 'open_link', 'CW_ACTIVE', 'CW_DEVICES_MAP', 'CW_ROLE_TASKS')
 HARDWARE = Path('/etc/egpu-nvidia/hardware.conf')
 CANDIDATE_DIR = Path('/var/home/keefeere/_repos/_home/cardwire-stable-process-access/'
-                     'dist/local-service-roles-166e817b64124e5a')
-DAEMON_SHA = '166e817b64124e5ac41e64b30008ecd33e4ff68774b1afb1fd69ef747226b306'
+                     'dist/local-service-roles-2152fd1621f7c39c')
+DAEMON_SHA = '2152fd1621f7c39c905c2bb9325de421c12f7566377720708181eb9e525116eb'
 OBJECT_SHA = 'e6b22a22cf515f510b830ce1aecab368dd71f23ece3d168ff0a0b996347f84d0'
 BUS = 'org.opengamingcollective.cardwire'
 OBJECT = '/org/opengamingcollective/cardwire'
@@ -165,6 +165,41 @@ def wait_port(port, seconds):
     raise RuntimeError(f'llama did not listen on {port}')
 
 
+KWIN_UNIT = 'plasma-kwin_wayland.service'
+KWIN_EXE = '/usr/bin/kwin_wayland'
+
+
+def kwin_cgroup(run_user=user_systemctl):
+    group = run_user('show', KWIN_UNIT, '-p', 'ControlGroup', '--value')
+    if not group.startswith('/') or '..' in group.split('/'):
+        raise RuntimeError('KWin control group not found')
+    return '/sys/fs/cgroup' + group
+
+
+def kwin_flow(before):
+    """Real display role WITHOUT a session restart: admit the running compositor by pidfd,
+    apply work-nvidia, require the desktop to stay alive and a plain process to be refused."""
+    ctl = ROOT / 'helpers/egpu-service-roles-ctl.py'
+    spec = f'0:user:{KWIN_UNIT}:{KWIN_EXE}:1000'
+    out = base.run(['/usr/bin/python3', str(ctl), 'reconcile', '--role-unit', spec])
+    if 'admitted pid' not in out:
+        raise RuntimeError(f'KWin compositor was not admitted: {out!r}')
+    print('KWIN ADMITTED: ' + out.replace('\n', ' | '), flush=True)
+    apply_profile('work-nvidia')
+    denied = user_can_open('/dev/nvidia0')
+    if denied == 0:
+        raise RuntimeError('work-nvidia admitted a plain non-role process')
+    # The compositor must still answer on the session bus (existing scanout FDs intact).
+    subprocess.run(['runuser', '-u', LLAMA_USER, '--', 'env', 'XDG_RUNTIME_DIR=/run/user/1000',
+                    'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus', 'busctl', '--user', 'call',
+                    'org.kde.KWin', '/KWin', 'org.kde.KWin', 'supportInformation'],
+                   check=True, capture_output=True, timeout=20)
+    print(f'KWIN ROLE OK under work-nvidia: plain process refused (errno {denied}); compositor answers. '
+          'Soaking 20 s - watch the screen.', flush=True)
+    time.sleep(20)
+    apply_profile('gaming-nvidia')
+
+
 def llama_flow(before):
     """Real compute role: llama restarts as a system unit, enrolled before exec,
     and must still use NVIDIA under work-nvidia while a plain process is refused."""
@@ -253,7 +288,7 @@ def restore():
               'KWin and llama unchanged.', flush=True)
 
 
-def execute(deny_probe, llama=False):
+def execute(deny_probe, llama=False, kwin=False):
     require_runtime()
     before = json.loads((ROOT / 'before.json').read_text())
     base.baseline_matches(before)
@@ -283,6 +318,9 @@ def execute(deny_probe, llama=False):
         if llama:
             llama_flow(before)
             return
+        if kwin:
+            kwin_flow(before)
+            return
         if deny_probe:
             apply_profile('work-nvidia')
             denied = user_can_open('/dev/nvidia0')
@@ -293,7 +331,7 @@ def execute(deny_probe, llama=False):
         time.sleep(5)  # short soak with the guard attached
 
 
-def start(deny_probe=False, llama=False):
+def start(deny_probe=False, llama=False, kwin=False):
     for path in (ROOT, DROPIN, CONFIG, PINS):
         if path.exists() or path.is_symlink():
             raise RuntimeError(f'Existing state must be inspected, not overwritten: {path}')
@@ -318,6 +356,10 @@ def start(deny_probe=False, llama=False):
         roles = [generator.parse_role(f'compute:{snapshot["exe"]}:{snapshot["cgroup"]}:1000')]
         (ROOT / 'service-roles.toml').write_text(generator.render(
             nodes, roles, str(ROOT / 'service_guard.bpf.o'), initial_profile='gaming-nvidia'))
+    elif kwin:
+        roles = [generator.parse_role(f'display:{KWIN_EXE}:{kwin_cgroup()}:1000')]
+        (ROOT / 'service-roles.toml').write_text(generator.render(
+            nodes, roles, str(ROOT / 'service_guard.bpf.o'), initial_profile='gaming-nvidia'))
     else:
         (ROOT / 'service-roles.toml').write_text(config_text(nodes))
     shutil.copy2(__file__, SCRIPT)
@@ -336,8 +378,9 @@ def start(deny_probe=False, llama=False):
                      'egpu-desktop-profile-plan.py', 'egpu-service-roles-ctl.py'):
         shutil.copy2(source / relative, helpers / Path(relative).name)
     flag = (['--execute-llama-role'] if llama else
+            ['--execute-kwin-role'] if kwin else
             ['--execute-deny-probe'] if deny_probe else ['--execute'])
-    lifetime = '330s' if llama else '150s'
+    lifetime = '330s' if llama else '200s' if kwin else '150s'
     base.run(['systemd-run', '--quiet', '--unit=' + UNIT, '--property=Type=exec',
               '--property=RuntimeMaxSec=' + lifetime, '--property=TimeoutStopSec=90s',
               '--property=KillMode=control-group',
@@ -384,6 +427,8 @@ ACTIONS = {
     '--start': lambda: start(False),
     '--start-with-deny-probe': lambda: start(True),
     '--start-llama-role': lambda: start(llama=True),
+    '--start-kwin-role': lambda: start(kwin=True),
+    '--execute-kwin-role': lambda: execute(False, False, True),
     '--execute-llama-role': lambda: execute(False, True),
     '--execute': lambda: execute(False),
     '--execute-deny-probe': lambda: execute(True),

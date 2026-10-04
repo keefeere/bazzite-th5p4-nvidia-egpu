@@ -2,6 +2,8 @@
 """Control the Cardwire service-roles owner (needs a cardwired built with it).
 
 status                      generation, current profile, live masks, profiles
+reconcile --role-unit ...   enroll roles to their services' CURRENT cgroup and admit the
+                            matching running processes (root; --loop for a service)
 apply PROFILE               apply a configured profile; verify readback; on a
                             failed readback restore the previous profile
 enroll INDEX UNIT [--exe P] re-enroll role INDEX after UNIT restarted (new
@@ -12,11 +14,13 @@ D-Bus methods are root-only, so run via sudo/pkexec or a root unit step.
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 SERVICE = "org.opengamingcollective.cardwire"
 OBJECT = "/org/opengamingcollective/cardwire"
@@ -125,12 +129,107 @@ def enroll(index, unit, exe=None, runner=run, cgroup_root=Path("/sys/fs/cgroup")
     return {"generation": parse_value(out), "executable": executable, "cgroup": cgroup}
 
 
+# ---- reconcile: keep configured roles bound to their CURRENT service identity ----
+
+ROLE_UNIT = re.compile(r"(\d{1,2}):(user|system):([A-Za-z0-9_.@:-]+\.service):(/[^\x00:]+):(\d+)")
+
+
+def parse_role_unit(text):
+    """INDEX:SCOPE:UNIT:EXE:UID, e.g. 1:user:plasma-kwin_wayland.service:/usr/bin/kwin_wayland:1000"""
+    match = ROLE_UNIT.fullmatch(text)
+    if not match or ".." in match.group(4).split("/") or int(match.group(1)) >= 16:
+        raise ValueError(f"invalid role unit {text!r}")
+    index, scope, unit, exe, uid = match.groups()
+    return {"index": int(index), "scope": scope, "unit": unit, "exe": exe, "uid": int(uid)}
+
+
+def parse_roles(text):
+    """a(tttu) -> [(incarnation, cgroup_id, exe_inode, uid)]"""
+    kind, _, rest = text.partition(" ")
+    if kind != "a(tttu)":
+        raise ValueError(f"unexpected Roles type {kind!r}")
+    numbers = [int(n) for n in rest.split()]
+    if not numbers or len(numbers) != 1 + 4 * numbers[0]:
+        raise ValueError("malformed Roles array")
+    return [tuple(numbers[1 + 4 * i: 5 + 4 * i]) for i in range(numbers[0])]
+
+
+def systemctl_show(scope, unit, prop, runner=run, user="keefeere"):
+    if scope == "system":
+        command = ["systemctl", "show", unit, "-p", prop, "--value"]
+    else:
+        command = ["runuser", "-u", user, "--", "env", "XDG_RUNTIME_DIR=/run/user/1000",
+                   "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+                   "systemctl", "--user", "show", unit, "-p", prop, "--value"]
+    return runner(command).stdout.strip()
+
+
+def process_start(pid, proc=Path("/proc")):
+    """starttime field of /proc/PID/stat (identifies a process across PID reuse)."""
+    text = (proc / str(pid) / "stat").read_text()
+    return text.rsplit(")", 1)[1].split()[19]
+
+
+def reconcile_role(spec, roles, admitted, runner=run, cgroup_root=Path("/sys/fs/cgroup"),
+                   proc=Path("/proc")):
+    """One role: enroll when the service has a new cgroup, admit its matching running
+    processes. Returns a list of human-readable actions (empty when already in sync)."""
+    actions = []
+    group = systemctl_show(spec["scope"], spec["unit"], "ControlGroup", runner)
+    if not group.startswith("/") or ".." in group.split("/"):
+        return [f"{spec['unit']}: not running"]
+    directory = cgroup_root / group.lstrip("/")
+    if not directory.is_dir():
+        return [f"{spec['unit']}: cgroup directory missing"]
+    index = spec["index"]
+    if index >= len(roles):
+        raise RuntimeError(f"role {index} is not in the catalog")
+    if roles[index][1] != directory.stat().st_ino:
+        result = enroll_paths(index, spec["exe"], str(directory), runner)
+        actions.append(f"{spec['unit']}: enrolled role {index} (generation {result})")
+    exe = os.path.realpath(spec["exe"])
+    for pid in (directory / "cgroup.procs").read_text().split():
+        try:
+            if os.path.realpath(os.readlink(proc / pid / "exe")) != exe:
+                continue
+            key = (pid, process_start(pid, proc))
+        except OSError:
+            continue
+        if key in admitted:
+            continue
+        try:
+            busctl(runner, "call", SERVICE, OBJECT, IFACE, "AdmitProcess", "uu", pid, str(index))
+            admitted.add(key)
+            actions.append(f"{spec['unit']}: admitted pid {pid}")
+        except RuntimeError as error:
+            actions.append(f"{spec['unit']}: pid {pid} not admitted: {error}")
+    return actions
+
+
+def enroll_paths(index, exe, cgroup, runner=run):
+    out = busctl(runner, "call", SERVICE, OBJECT, IFACE, "ReEnrollRole", "uss", str(index), exe, cgroup)
+    return parse_value(out)
+
+
+def reconcile(specs, admitted, runner=run, **kwargs):
+    roles = parse_roles(get_property(runner, "Roles"))
+    actions = []
+    for spec in specs:
+        actions += reconcile_role(spec, roles, admitted, runner, **kwargs)
+        roles = parse_roles(get_property(runner, "Roles"))  # enrollment changes identities
+    return actions
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     p = sub.add_parser("apply")
     p.add_argument("profile")
+    p = sub.add_parser("reconcile")
+    p.add_argument("--role-unit", action="append", required=True, type=parse_role_unit)
+    p.add_argument("--loop", action="store_true")
+    p.add_argument("--interval", type=float, default=5.0)
     p = sub.add_parser("enroll")
     p.add_argument("index", type=int)
     p.add_argument("unit")
@@ -139,6 +238,19 @@ def main(argv=None):
     try:
         if args.command == "status":
             result = status()
+        elif args.command == "reconcile":
+            admitted = set()
+            while True:
+                try:
+                    for line in reconcile(args.role_unit, admitted):
+                        print(line, flush=True)
+                except (RuntimeError, ValueError, OSError) as error:
+                    if not args.loop:
+                        raise
+                    print(f"reconcile: {error}", file=sys.stderr, flush=True)
+                if not args.loop:
+                    return 0
+                time.sleep(max(1.0, args.interval))
         elif args.command == "apply":
             result = apply_profile(args.profile)
         else:
