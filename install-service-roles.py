@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 from pathlib import Path
 import shutil
 import subprocess
@@ -32,6 +33,12 @@ DROPIN = Path('/etc/systemd/system/cardwired.service.d/96-service-roles.conf')
 CONFIG = Path('/etc/cardwire/service-roles.toml')
 UNIT_FILE = Path('/etc/systemd/system/egpu-service-roles-reconcile.service')
 RECONCILE = 'egpu-service-roles-reconcile.service'
+PROFILE_UNIT_SRC = HERE / 'egpu-service-roles-profile@.service'
+PROFILE_UNIT = Path('/etc/systemd/system/egpu-service-roles-profile@.service')
+POLKIT_SRC = HERE / '49-egpu-service-roles.rules.in'
+POLKIT = Path('/etc/polkit-1/rules.d/49-egpu-service-roles.rules')
+PLASMOID_SRC = HERE / 'plasmoid/com.keefeere.egpu'
+PLASMOID_BACKUP_SUFFIX = '.pre-service-roles'
 PINS = Path('/sys/fs/bpf/cardwire-service-roles')
 PIN_NAMES = ('exec_link', 'open_link', 'CW_ACTIVE', 'CW_DEVICES_MAP', 'CW_ROLE_TASKS')
 HARDWARE = Path('/etc/egpu-nvidia/hardware.conf')
@@ -112,6 +119,59 @@ def config_text():
                             initial_profile='gaming-nvidia')
 
 
+def desktop_user():
+    planner = load(HERE / 'egpu-desktop-profile-plan.py', 'planner')
+    return planner.read_hardware_config(HARDWARE)['DESKTOP_USER']
+
+
+def polkit_text(user):
+    return POLKIT_SRC.read_text().replace('@DESKTOP_USER@', user)
+
+
+def plasmoid_dir(user):
+    return Path(pwd.getpwnam(user).pw_dir) / '.local/share/plasma/plasmoids/com.keefeere.egpu'
+
+
+def install_gui():
+    """Profile switch in the Plasma widget: exact polkit-whitelisted units + widget update."""
+    user = desktop_user()
+    target = plasmoid_dir(user)
+    qml, meta = target / 'contents/ui/main.qml', target / 'metadata.json'
+    if not qml.is_file() or not meta.is_file():
+        raise RuntimeError(f'eGPU widget is not installed at {target}')
+    for path in (PROFILE_UNIT, POLKIT, Path(str(qml) + PLASMOID_BACKUP_SUFFIX), Path(str(meta) + PLASMOID_BACKUP_SUFFIX)):
+        if path.exists() or path.is_symlink():
+            raise RuntimeError(f'GUI state already present: {path}')
+    write_new(PROFILE_UNIT, PROFILE_UNIT_SRC.read_text(), 0o644)
+    write_new(POLKIT, polkit_text(user), 0o644)
+    info = pwd.getpwnam(user)
+    for name, source in ((qml, PLASMOID_SRC / 'contents/ui/main.qml'), (meta, PLASMOID_SRC / 'metadata.json')):
+        shutil.copy2(name, str(name) + PLASMOID_BACKUP_SUFFIX)
+        shutil.copy2(source, name)
+        os.chown(name, info.pw_uid, info.pw_gid)
+        os.chown(str(name) + PLASMOID_BACKUP_SUFFIX, info.pw_uid, info.pw_gid)
+    run(['systemctl', 'daemon-reload'])
+
+
+def remove_gui():
+    try:
+        user = desktop_user()
+    except Exception:  # hardware.conf gone: leave the user's widget untouched
+        user = None
+    checked_remove(PROFILE_UNIT, PROFILE_UNIT_SRC.read_text())
+    if user:
+        checked_remove(POLKIT, polkit_text(user))
+        target = plasmoid_dir(user)
+        for name, source in ((target / 'contents/ui/main.qml', PLASMOID_SRC / 'contents/ui/main.qml'),
+                             (target / 'metadata.json', PLASMOID_SRC / 'metadata.json')):
+            backup = Path(str(name) + PLASMOID_BACKUP_SUFFIX)
+            if backup.exists():
+                if name.read_text() == source.read_text():
+                    os.replace(backup, name)
+                else:
+                    print(f'Widget file changed since install; kept as is: {name} (backup: {backup})', file=sys.stderr)
+
+
 def write_new(path, text, mode_bits):
     if path.exists() or path.is_symlink():
         raise RuntimeError(f'Existing state must be inspected, not overwritten: {path}')
@@ -146,6 +206,7 @@ def checked_remove(path, expected_text):
 
 def uninstall(expected_config=None):
     run(['systemctl', 'disable', '--now', RECONCILE], check=False)
+    remove_gui()
     checked_remove(UNIT_FILE, (unit_text(), unit_text('Requires')))  # Requires: first release
     run(['systemctl', 'stop', 'cardwired.service'], timeout=90)
     run(['systemctl', 'clean', '--what=fdstore', 'cardwired.service'], check=False)
@@ -210,7 +271,14 @@ def install():
             if time.monotonic() > deadline:
                 raise RuntimeError(f'Reconciler did not enroll/admit KWin in time: {log[-400:]}')
             time.sleep(2)
+        try:
+            install_gui()
+            gui = 'Plasma widget profile switch installed (re-add/refresh the widget or log in again).'
+        except Exception as error:
+            remove_gui()
+            gui = f'GUI NOT installed ({error}); core service-roles is active.'
         run(['nvidia-smi', '-L'], timeout=20)
+        print(gui)
         print('INSTALLED: service-roles Cardwire active (Gaming profile), reconciler running.\n' + log[-600:], flush=True)
     except Exception:
         print('INSTALL FAILED: rolling back', file=sys.stderr, flush=True)

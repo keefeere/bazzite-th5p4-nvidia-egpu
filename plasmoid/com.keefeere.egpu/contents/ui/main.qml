@@ -22,6 +22,21 @@ PlasmoidItem {
     readonly property string detachCommand: "/usr/bin/systemctl start egpu-nvidia-detach.service"
     readonly property string attachCommand: "/usr/bin/systemctl start egpu-nvidia-hot-attach.service"
 
+    // GPU service-roles profiles (Cardwire). Reading the current profile needs no privilege;
+    // applying one starts an exact polkit-whitelisted system unit.
+    readonly property string profileReadCommand: "/usr/bin/busctl --system get-property org.opengamingcollective.cardwire /org/opengamingcollective/cardwire org.opengamingcollective.cardwire.ServiceRoles CurrentProfile"
+    readonly property var profiles: [
+        { id: "gaming-nvidia", icon: "applications-games", label: localized("Gaming", "Ігри"),
+          hint: localized("NVIDIA renders and drives displays; every app may use it.", "NVIDIA рендерить і виводить зображення; усі програми можуть її використовувати.") },
+        { id: "work-nvidia", icon: "preferences-desktop-display", label: localized("Work: NVIDIA displays", "Робота: дисплеї NVIDIA"),
+          hint: localized("AMD renders; NVIDIA only drives displays and runs allowed compute (llama).", "AMD рендерить; NVIDIA лише виводить зображення та виконує дозволені обчислення (llama).") },
+        { id: "work-igpu", icon: "cpu", label: localized("Work: iGPU displays", "Робота: дисплеї iGPU"),
+          hint: localized("AMD renders and displays; NVIDIA only runs allowed compute.", "AMD рендерить і виводить зображення; NVIDIA лише для дозволених обчислень.") }
+    ]
+    property string currentProfile: ""
+    property string pendingProfile: ""
+    property string profileError: ""
+
     property string egpuState: "unknown"
 
     property string stateTitle: localized("Checking eGPU…", "Перевіряємо eGPU…")
@@ -76,6 +91,24 @@ PlasmoidItem {
         }
     }
 
+    function refreshProfile() {
+        if (!profileSource.connectedSources.includes(profileReadCommand)) {
+            profileSource.connectSource(profileReadCommand);
+        }
+    }
+
+    function applyProfile(output) {
+        const match = output.trim().match(/^s "([a-z0-9_-]*)"$/);
+        currentProfile = match ? match[1] : "";
+    }
+
+    function beginProfile(profileId) {
+        confirmationAction = "";
+        profileError = "";
+        pendingProfile = profileId;
+        profileApplySource.connectSource("/usr/bin/systemctl start egpu-service-roles-profile@" + profileId + ".service");
+    }
+
     function beginDetach() {
         confirmationAction = "";
         commandError = "";
@@ -120,6 +153,36 @@ PlasmoidItem {
     }
 
     Plasma5Support.DataSource {
+        id: profileSource
+        engine: "executable"
+        connectedSources: []
+
+        onNewData: function(sourceName, data) {
+            disconnectSource(sourceName);
+            // An error (interface absent) simply hides the profile section.
+            root.applyProfile((data["exit code"] ?? 1) === 0 ? (data["stdout"] ?? "") : "");
+        }
+    }
+
+    Plasma5Support.DataSource {
+        id: profileApplySource
+        engine: "executable"
+        connectedSources: []
+
+        onNewData: function(sourceName, data) {
+            disconnectSource(sourceName);
+            const exitCode = data["exit code"] ?? data["exitCode"] ?? 0;
+            if (exitCode !== 0) {
+                const stderr = (data["stderr"] ?? "").trim();
+                root.profileError = stderr.length > 0 ? stderr :
+                    root.localized("The profile was not applied (exit code ", "Профіль не застосовано (код ") + exitCode + ")";
+            }
+            root.pendingProfile = "";
+            root.refreshProfile();
+        }
+    }
+
+    Plasma5Support.DataSource {
         id: detachSource
         engine: "executable"
         connectedSources: []
@@ -141,7 +204,7 @@ PlasmoidItem {
         repeat: true
         running: true
         triggeredOnStart: true
-        onTriggered: root.refreshStatus()
+        onTriggered: { root.refreshStatus(); root.refreshProfile(); }
     }
 
     compactRepresentation: Item {
@@ -220,6 +283,53 @@ PlasmoidItem {
                         "Поточний графічний сеанс буде завершено для запуску NVIDIA як основної GPU."
                     )
                 color: Kirigami.Theme.neutralTextColor
+                wrapMode: Text.Wrap
+            }
+
+            Kirigami.Separator {
+                Layout.fillWidth: true
+                visible: root.currentProfile.length > 0
+            }
+
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                visible: root.currentProfile.length > 0
+                text: root.localized("GPU profile", "Профіль GPU")
+                font.bold: true
+            }
+
+            Repeater {
+                model: root.currentProfile.length > 0 ? root.profiles : []
+
+                delegate: PlasmaComponents3.Button {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    icon.name: modelData.icon
+                    text: modelData.label
+                    checkable: true
+                    checked: root.currentProfile === modelData.id
+                    enabled: root.pendingProfile.length === 0 && !checked
+                    PlasmaComponents3.ToolTip.text: modelData.hint
+                    PlasmaComponents3.ToolTip.visible: hovered
+                    onClicked: root.beginProfile(modelData.id)
+                }
+            }
+
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                visible: root.currentProfile.length > 0 && root.currentProfile !== "gaming-nvidia"
+                text: root.localized(
+                    "In a work profile, new programs cannot use NVIDIA; running apps, the compositor and llama are unaffected.",
+                    "У робочому профілі нові програми не можуть використовувати NVIDIA; запущені програми, компoзитор і llama не зачіпаються.")
+                opacity: 0.75
+                wrapMode: Text.Wrap
+            }
+
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                visible: root.profileError.length > 0
+                text: root.profileError
+                color: Kirigami.Theme.negativeTextColor
                 wrapMode: Text.Wrap
             }
 

@@ -92,6 +92,46 @@ class Installer(unittest.TestCase):
                 inst.install()
             digest.assert_not_called()
 
+    def test_polkit_rule_is_exact_and_user_scoped(self):
+        text = inst.polkit_text('keefeere')
+        self.assertIn('subject.user == "keefeere"', text)
+        for profile in ('gaming-nvidia', 'work-nvidia', 'work-igpu'):
+            self.assertIn(f'"egpu-service-roles-profile@{profile}.service"', text)
+        self.assertNotIn('*', text)            # no wildcard instance
+        self.assertNotIn('@DESKTOP_USER@', text)
+        self.assertIn('action.lookup("verb") == "start"', text)
+        self.assertIn('subject.local && subject.active', text)
+
+    def test_profile_unit_runs_only_the_control_tool(self):
+        text = inst.PROFILE_UNIT_SRC.read_text()
+        self.assertIn('Type=oneshot', text)
+        self.assertEqual(text.count('ExecStart='), 1)
+        self.assertIn('egpu-service-roles-ctl.py apply %i', text)
+
+    def test_widget_lists_exactly_the_whitelisted_profiles(self):
+        qml = (inst.PLASMOID_SRC / 'contents/ui/main.qml').read_text()
+        for profile in ('gaming-nvidia', 'work-nvidia', 'work-igpu'):
+            self.assertIn(f'id: "{profile}"', qml)
+        self.assertEqual(qml.count('egpu-service-roles-profile@'), 1)  # one command template
+        self.assertNotIn('pkexec', qml)
+        self.assertNotIn('sudo', qml)
+
+    def test_gui_install_refuses_existing_state_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            qml = home / '.local/share/plasma/plasmoids/com.keefeere.egpu/contents/ui/main.qml'
+            qml.parent.mkdir(parents=True)
+            qml.write_text('old')
+            (qml.parents[2] / 'metadata.json').write_text('{}')
+            Path(str(qml) + inst.PLASMOID_BACKUP_SUFFIX).write_text('leftover')
+            with patch.object(inst, 'desktop_user', return_value='u'), \
+                    patch.object(inst.pwd, 'getpwnam', return_value=type('P', (), {'pw_dir': str(home), 'pw_uid': 1, 'pw_gid': 1})()), \
+                    patch.object(inst, 'PROFILE_UNIT', home / 'unit'), patch.object(inst, 'POLKIT', home / 'rule'):
+                with self.assertRaisesRegex(RuntimeError, 'already present'):
+                    inst.install_gui()
+            self.assertEqual(qml.read_text(), 'old')
+            self.assertFalse((home / 'unit').exists())
+
     def test_only_known_actions(self):
         self.assertEqual(set(inst.ACTIONS), {'--install', '--uninstall', '--status'})
 

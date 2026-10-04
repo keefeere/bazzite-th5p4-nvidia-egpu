@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply the %i GPU service-roles profile (Cardwire)
+ConditionPathExists=/var/opt/egpu-nvidia-service-roles/egpu-service-roles-ctl.py
+
+[Service]
+Type=oneshot
+# %i is validated by the control tool (strict name pattern AND a configured profile);
+# the polkit rule only allows exactly the three known instances to be started.
+ExecStart=/usr/bin/python3 /var/opt/egpu-nvidia-service-roles/egpu-service-roles-ctl.py apply %i
