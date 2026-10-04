@@ -140,6 +140,27 @@ class Guards(unittest.TestCase):
             (root / 'u.service/cgroup.procs').write_text('1\n')
             self.assertEqual(trial.nvidia_fds('u', root), set())  # pid 1 fds unreadable or non-NVIDIA
 
+    def test_archive_after_llama_trial_ignores_llama_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'trial'
+            root.mkdir(mode=0o700)
+            (root / 'restored').write_text('')
+            (root / 'llama-stopped').write_text('')
+            (root / 'before.json').write_text(json.dumps(
+                {'policy': {}, 'files': {}, 'clients': {'plasma-kwin_wayland.service': {'MainPID': '1'}}}))
+            seen = {}
+            def baseline(before, include_clients=True):
+                seen['include_clients'] = include_clients
+            with patch.object(trial, 'ROOT', root), patch.object(trial, 'DROPIN', Path(tmp) / 'd'), \
+                    patch.object(trial, 'CONFIG', Path(tmp) / 'c'), patch.object(trial, 'PINS', Path(tmp) / 'p'), \
+                    patch.object(trial.base, 'owned_trial_directory'), patch.object(trial.base, 'quiescent_unit'), \
+                    patch.object(trial.base, 'baseline_matches', side_effect=baseline), \
+                    patch.object(trial.base, 'clients', return_value={'plasma-kwin_wayland.service': {'MainPID': '1'}}), \
+                    patch.object(trial.base, 'run', return_value='not-found'), \
+                    patch.object(trial.fcntl, 'flock'), patch('builtins.open', create=True):
+                trial.archive_restored()
+            self.assertFalse(seen['include_clients'])
+
     def test_only_known_actions(self):
         self.assertEqual(set(trial.ACTIONS), {'--start', '--start-with-deny-probe', '--execute',
                                               '--execute-deny-probe', '--restore', '--archive-restored',

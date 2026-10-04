@@ -357,13 +357,20 @@ def archive_restored():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         base.owned_trial_directory(ROOT)
         marker = ROOT / 'restored'
-        if marker.is_symlink() or not marker.is_file() or marker.stat().st_uid != 0:
+        if marker.is_symlink() or not marker.is_file() or marker.stat().st_uid != os.geteuid():
             raise RuntimeError('Successful rollback is not recorded')
         for path in (DROPIN, CONFIG, PINS):
             if path.exists() or path.is_symlink():
                 raise RuntimeError(f'State still exists: {path}')
         base.quiescent_unit(UNIT + '.service')
-        base.baseline_matches(json.loads((ROOT / 'before.json').read_text()))
+        before = json.loads((ROOT / 'before.json').read_text())
+        llama_mode = (ROOT / 'llama-stopped').exists()
+        # A llama trial legitimately gives llama a new identity; only KWin must match.
+        base.baseline_matches(before, include_clients=not llama_mode)
+        if llama_mode:
+            kwin = 'plasma-kwin_wayland.service'
+            if base.clients()[kwin] != before['clients'][kwin]:
+                raise RuntimeError('KWin identity changed during test')
         destination = Path(tempfile.mkdtemp(prefix=ROOT.name + '-archive-', dir=ROOT.parent)) / 'trial'
         ROOT.rename(destination)
         # A successful trial leaves no unit to reset; only a failed one does.
