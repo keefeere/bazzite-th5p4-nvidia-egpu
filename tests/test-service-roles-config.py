@@ -22,6 +22,14 @@ class ServiceRolesConfig(unittest.TestCase):
         self.assertEqual(gen.masks("work-nvidia", ROLES, NODES), [12, 7])
         self.assertEqual(gen.masks("work-igpu", ROLES, NODES), [12, 0])
 
+    def test_default_mask_only_open_for_gaming(self):
+        self.assertEqual(gen.default_mask("gaming-nvidia", NODES), 15)
+        self.assertEqual(gen.default_mask("work-nvidia", NODES), 0)
+        self.assertEqual(gen.default_mask("work-igpu", NODES), 0)
+        text = gen.render(NODES, ROLES, "/o.bpf.o")
+        self.assertIn("permissions = [15, 15]\ndefault_mask = 15", text)
+        self.assertIn("permissions = [12, 0]\ndefault_mask = 0", text)
+
     def test_masks_fit_device_count_and_toml_shape(self):
         text = gen.render(NODES, ROLES, "/o.bpf.o")
         self.assertEqual(text.count("[[role]]"), 2)

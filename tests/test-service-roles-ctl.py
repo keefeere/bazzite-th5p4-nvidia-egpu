@@ -30,7 +30,7 @@ class FakeBus:
         if verb == "get-property":
             name = args[-1]
             return done({"Generation": "t 3", "CurrentProfile": f's "{self.current}"',
-                         "Permissions": "au 2 1 3",
+                         "Permissions": "au 2 1 3", "DefaultMask": "u 0",
                          "Profiles": 'as 2 "gaming" "work"'}[name])
         if verb == "call" and args[-3] == "ApplyProfile":
             target = args[-1]
@@ -56,6 +56,7 @@ class Ctl(unittest.TestCase):
     def test_status_and_apply(self):
         bus = FakeBus()
         self.assertEqual(ctl.status(bus)["permissions"], [1, 3])
+        self.assertEqual(ctl.status(bus)["default_mask"], 0)
         result = ctl.apply_profile("work", bus)
         self.assertEqual((result["applied"], result["previous"]), ("work", "gaming"))
 

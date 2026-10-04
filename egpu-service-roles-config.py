@@ -99,6 +99,11 @@ def masks(profile, roles, nodes):
     return result
 
 
+def default_mask(profile, nodes):
+    """Gaming keeps ordinary NVIDIA access for every process; Work is roles-only."""
+    return (1 << len(nodes)) - 1 if profile == "gaming-nvidia" else 0
+
+
 def render(nodes, roles, bpf_object, unit="cardwired.service"):
     if not 1 <= len(roles) <= MAX_ROLES:
         raise ValueError("1..16 roles required")
@@ -113,7 +118,8 @@ def render(nodes, roles, bpf_object, unit="cardwired.service"):
                 f'cgroup = "{cgroup}"', f"uid = {uid}", ""]
     for profile in PROFILES:
         out += ["[[profile]]", f'name = "{profile}"',
-                f"permissions = {masks(profile, roles, nodes)}", ""]
+                f"permissions = {masks(profile, roles, nodes)}",
+                f"default_mask = {default_mask(profile, nodes)}", ""]
     return "\n".join(out)
 
 

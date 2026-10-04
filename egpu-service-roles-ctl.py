@@ -43,7 +43,7 @@ def get_property(runner, name):
 def parse_value(text):
     """Parse the busctl subset used here: t N | s "x" | au N ... | as N "a" ..."""
     kind, _, rest = text.partition(" ")
-    if kind == "t":
+    if kind in ("t", "u"):
         return int(rest)
     if kind == "s":
         return rest.strip().strip('"')
@@ -65,6 +65,7 @@ def status(runner=run):
         "generation": parse_value(get_property(runner, "Generation")),
         "current_profile": parse_value(get_property(runner, "CurrentProfile")),
         "permissions": parse_value(get_property(runner, "Permissions")),
+        "default_mask": parse_value(get_property(runner, "DefaultMask")),
         "profiles": parse_value(get_property(runner, "Profiles")),
     }
 
