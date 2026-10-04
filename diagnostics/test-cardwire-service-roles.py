@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -87,6 +88,101 @@ def user_can_open(path):
     return subprocess.run(['runuser', '-u', 'keefeere', '--', 'python3', '-c', code]).returncode
 
 
+LLAMA_TRANSIENT = 'egpu-llama-role-test'
+LLAMA_USER = 'keefeere'
+LLAMA_PORT = 9931
+ENV_KEEP = ('HOME', 'USER', 'LOGNAME', 'PATH', 'LANG', 'LD_LIBRARY_PATH', 'HF_HOME', 'XDG_CACHE_HOME')
+ENV_PREFIXES = ('CUDA', 'GGML_', 'LLAMA_', 'NVIDIA_')
+
+
+def user_systemctl(*args, check=True):
+    command = ['runuser', '-u', LLAMA_USER, '--', 'env', 'XDG_RUNTIME_DIR=/run/user/1000',
+               'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus',
+               'systemctl', '--user', *args]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    if check and result.returncode:
+        raise RuntimeError(f'systemctl --user {args}: {result.stderr.strip()}')
+    return result.stdout.strip()
+
+
+def llama_snapshot(proc=Path('/proc'), run_user=user_systemctl):
+    """Exact argv/cwd/whitelisted env of the running user llama service."""
+    pid = run_user('show', 'llama.service', '-p', 'MainPID', '--value')
+    if not pid.isdigit() or int(pid) <= 1:
+        raise RuntimeError('llama.service must be running')
+    base_dir = proc / pid
+    argv = [a.decode() for a in (base_dir / 'cmdline').read_bytes().split(b'\0')[:-1]]
+    env = {}
+    for item in (base_dir / 'environ').read_bytes().split(b'\0'):
+        key, _, value = item.decode(errors='replace').partition('=')
+        if key in ENV_KEEP or key.startswith(ENV_PREFIXES):
+            env[key] = value
+    group = run_user('show', 'llama.service', '-p', 'ControlGroup', '--value')
+    if not group.startswith('/') or '..' in group.split('/'):
+        raise RuntimeError('unexpected llama control group')
+    return {'exe': os.path.realpath(os.readlink(base_dir / 'exe')), 'argv': argv,
+            'cwd': os.readlink(base_dir / 'cwd'), 'env': env,
+            'cgroup': '/sys/fs/cgroup' + group}
+
+
+def llama_run_command(snapshot, ctl):
+    """systemd-run line: a SYSTEM unit as the user, enrolled by a root ExecStartPre BEFORE exec."""
+    enroll = (f'+/usr/bin/python3 {ctl} enroll 0 {LLAMA_TRANSIENT}.service --exe {snapshot["exe"]}')
+    command = ['systemd-run', '--quiet', '--unit=' + LLAMA_TRANSIENT, '--uid=' + LLAMA_USER,
+               '--property=Type=exec', '--property=Restart=no',
+               '--property=WorkingDirectory=' + snapshot['cwd'],
+               '--property=ExecStartPre=' + enroll]
+    command += [f'--setenv={key}={value}' for key, value in sorted(snapshot['env'].items())]
+    return command + ['--', snapshot['exe'], *snapshot['argv'][1:]]
+
+
+def nvidia_fds(unit, root=Path('/sys/fs/cgroup/system.slice')):
+    """NVIDIA device nodes held open by any process of the unit's cgroup."""
+    found = set()
+    for pid in (root / (unit + '.service') / 'cgroup.procs').read_text().split():
+        try:
+            for fd in (Path('/proc') / pid / 'fd').iterdir():
+                target = os.readlink(fd)
+                if target.startswith('/dev/nvidia'):
+                    found.add(target)
+        except OSError:
+            continue
+    return found
+
+
+def wait_port(port, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            if probe.connect_ex(('127.0.0.1', port)) == 0:
+                return
+        time.sleep(1)
+    raise RuntimeError(f'llama did not listen on {port}')
+
+
+def llama_flow(before):
+    """Real compute role: llama restarts as a system unit, enrolled before exec,
+    and must still use NVIDIA under work-nvidia while a plain process is refused."""
+    user_systemctl('stop', 'llama.service')
+    (ROOT / 'llama-stopped').touch()
+    apply_profile('work-nvidia')
+    snapshot = json.loads((ROOT / 'llama.json').read_text())
+    base.run(llama_run_command(snapshot, ROOT / 'helpers/egpu-service-roles-ctl.py'))
+    wait_port(LLAMA_PORT, 120)
+    held = nvidia_fds(LLAMA_TRANSIENT)
+    if not held:
+        raise RuntimeError('llama runs but holds no NVIDIA device: role not admitted')
+    denied = user_can_open('/dev/nvidia0')
+    if denied == 0:
+        raise RuntimeError('work-nvidia admitted a plain non-role process')
+    print(f'LLAMA ROLE OK: llama holds {sorted(held)} under work-nvidia; plain process refused '
+          f'(errno {denied}).', flush=True)
+    apply_profile('gaming-nvidia')
+    base.run(['systemctl', 'stop', LLAMA_TRANSIENT + '.service'], timeout=100)
+    user_systemctl('start', 'llama.service')
+
+
 def require_runtime():
     if (Path(__file__).resolve() != SCRIPT or ROOT.is_symlink()
             or ROOT.stat().st_uid != 0 or ROOT.stat().st_mode & 0o077):
@@ -112,6 +208,11 @@ def restore():
         if (ROOT / 'restored').exists():
             return
         before = json.loads((ROOT / 'before.json').read_text())
+        llama_mode = (ROOT / 'llama-stopped').exists()
+        if llama_mode:
+            subprocess.run(['systemctl', 'stop', LLAMA_TRANSIENT + '.service'], timeout=100)
+            if user_systemctl('show', 'llama.service', '-p', 'ActiveState', '--value') != 'active':
+                user_systemctl('start', 'llama.service')
         if (ROOT / 'activation-started').exists():
             # Stop first: the daemon holds no references after exit, then drop the
             # preserved FD store and the pins so the hooks are released.
@@ -133,7 +234,12 @@ def restore():
                 raise RuntimeError('Recovery binary changed')
             base.run(['systemctl', 'daemon-reload'])
             base.run(['systemctl', 'start', 'cardwired.service'], timeout=60)
-        base.baseline_matches(before)
+        base.baseline_matches(before, include_clients=not llama_mode)
+        if llama_mode:
+            # llama legitimately has a new identity; KWin must be untouched.
+            kwin = 'plasma-kwin_wayland.service'
+            if base.clients()[kwin] != before['clients'][kwin]:
+                raise RuntimeError('KWin identity changed during test')
         if PINS.exists():
             raise RuntimeError('Guard pins survived rollback')
         (ROOT / 'restored').touch()
@@ -141,7 +247,7 @@ def restore():
               'KWin and llama unchanged.', flush=True)
 
 
-def execute(deny_probe):
+def execute(deny_probe, llama=False):
     require_runtime()
     before = json.loads((ROOT / 'before.json').read_text())
     base.baseline_matches(before)
@@ -168,6 +274,9 @@ def execute(deny_probe):
         if base.clients() != before['clients']:
             raise RuntimeError('KWin or llama identity changed')
         print('GAMING PROFILE OK: guard active, user opens NVIDIA nodes, session unchanged.', flush=True)
+        if llama:
+            llama_flow(before)
+            return
         if deny_probe:
             apply_profile('work-nvidia')
             denied = user_can_open('/dev/nvidia0')
@@ -178,7 +287,7 @@ def execute(deny_probe):
         time.sleep(5)  # short soak with the guard attached
 
 
-def start(deny_probe=False):
+def start(deny_probe=False, llama=False):
     for path in (ROOT, DROPIN, CONFIG, PINS):
         if path.exists() or path.is_symlink():
             raise RuntimeError(f'Existing state must be inspected, not overwritten: {path}')
@@ -195,9 +304,16 @@ def start(deny_probe=False):
     planner = load(locate('egpu-desktop-profile-plan.py'), 'planner')
     identity = planner.read_hardware_config(HARDWARE)
     nodes = generator.inventory(identity['EGPU_VENDOR'], identity['EGPU_DEVICE'])
+    snapshot = llama_snapshot() if llama else None
     ROOT.mkdir(mode=0o700)
     (ROOT / 'before.json').write_text(json.dumps(before, indent=2))
-    (ROOT / 'service-roles.toml').write_text(config_text(nodes))
+    if llama:
+        (ROOT / 'llama.json').write_text(json.dumps(snapshot, indent=2))
+        roles = [generator.parse_role(f'compute:{snapshot["exe"]}:{snapshot["cgroup"]}:1000')]
+        (ROOT / 'service-roles.toml').write_text(generator.render(
+            nodes, roles, str(ROOT / 'service_guard.bpf.o'), initial_profile='gaming-nvidia'))
+    else:
+        (ROOT / 'service-roles.toml').write_text(config_text(nodes))
     shutil.copy2(__file__, SCRIPT)
     shutil.copy2(CANDIDATE_DIR / 'bin/cardwired', ROOT / 'cardwired')
     os.chmod(ROOT / 'cardwired', 0o755)
@@ -211,11 +327,13 @@ def start(deny_probe=False):
     helpers.mkdir()
     source = HERE.parent
     for relative in ('diagnostics/test-cardwire-exact-candidate.py', 'egpu-service-roles-config.py',
-                     'egpu-desktop-profile-plan.py'):
+                     'egpu-desktop-profile-plan.py', 'egpu-service-roles-ctl.py'):
         shutil.copy2(source / relative, helpers / Path(relative).name)
-    flag = ['--execute-deny-probe'] if deny_probe else ['--execute']
+    flag = (['--execute-llama-role'] if llama else
+            ['--execute-deny-probe'] if deny_probe else ['--execute'])
+    lifetime = '330s' if llama else '150s'
     base.run(['systemd-run', '--quiet', '--unit=' + UNIT, '--property=Type=exec',
-              '--property=RuntimeMaxSec=150s', '--property=TimeoutStopSec=90s',
+              '--property=RuntimeMaxSec=' + lifetime, '--property=TimeoutStopSec=90s',
               '--property=KillMode=control-group',
               '--property=ExecStopPost=/usr/bin/python3 ' + str(SCRIPT) + ' --restore',
               '/usr/bin/python3', str(SCRIPT), *flag])
@@ -252,6 +370,8 @@ ACTIONS = {
     '--archive-restored': archive_restored,
     '--start': lambda: start(False),
     '--start-with-deny-probe': lambda: start(True),
+    '--start-llama-role': lambda: start(llama=True),
+    '--execute-llama-role': lambda: execute(False, True),
     '--execute': lambda: execute(False),
     '--execute-deny-probe': lambda: execute(True),
     '--restore': restore,

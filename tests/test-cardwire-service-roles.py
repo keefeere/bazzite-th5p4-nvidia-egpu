@@ -102,9 +102,45 @@ class Guards(unittest.TestCase):
                 run.assert_not_called()
                 self.assertTrue(root.exists())
 
+    def test_llama_command_enrolls_as_root_before_exec(self):
+        snap = {'exe': '/home/u/.local/bin/llama', 'argv': ['llama', 'serve', '--port', '9931'],
+                'cwd': '/home/u', 'env': {'HOME': '/home/u', 'CUDA_VISIBLE_DEVICES': '0'}}
+        command = trial.llama_run_command(snap, Path('/run/t/helpers/ctl.py'))
+        pre = [a for a in command if a.startswith('--property=ExecStartPre=')][0]
+        self.assertTrue(pre.startswith('--property=ExecStartPre=+/usr/bin/python3 /run/t/helpers/ctl.py enroll 0 '))
+        self.assertIn('--exe /home/u/.local/bin/llama', pre)
+        self.assertIn('--uid=keefeere', command)
+        self.assertIn('--setenv=CUDA_VISIBLE_DEVICES=0', command)
+        self.assertEqual(command[command.index('--') + 1:], ['/home/u/.local/bin/llama', 'serve', '--port', '9931'])
+
+    def test_snapshot_whitelists_environment_and_exact_argv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp)
+            (proc / '42').mkdir()
+            (proc / '42/cmdline').write_bytes(b'/x/llama\0serve\0--port\09931\0')
+            (proc / '42/environ').write_bytes(b'HOME=/h\0SECRET_TOKEN=abc\0CUDA_X=1\0PATH=/bin\0')
+            os.symlink('/bin/sh', proc / '42/exe')
+            os.symlink('/home', proc / '42/cwd')
+            answers = {'MainPID': '42', 'ControlGroup': '/user.slice/llama.service'}
+            snap = trial.llama_snapshot(proc, lambda *a, **k: answers[a[3]])
+        self.assertEqual(snap['argv'], ['/x/llama', 'serve', '--port', '9931'])
+        self.assertEqual(snap['env'], {'HOME': '/h', 'CUDA_X': '1', 'PATH': '/bin'})
+        self.assertNotIn('SECRET_TOKEN', snap['env'])
+        self.assertEqual(snap['cgroup'], '/sys/fs/cgroup/user.slice/llama.service')
+        with self.assertRaises(RuntimeError):
+            trial.llama_snapshot(Path('/nonexistent'), lambda *a, **k: '0')
+
+    def test_nvidia_fd_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'u.service').mkdir()
+            (root / 'u.service/cgroup.procs').write_text('1\n')
+            self.assertEqual(trial.nvidia_fds('u', root), set())  # pid 1 fds unreadable or non-NVIDIA
+
     def test_only_known_actions(self):
         self.assertEqual(set(trial.ACTIONS), {'--start', '--start-with-deny-probe', '--execute',
-                                              '--execute-deny-probe', '--restore', '--archive-restored'})
+                                              '--execute-deny-probe', '--restore', '--archive-restored',
+                                              '--start-llama-role', '--execute-llama-role'})
 
 
 if __name__ == '__main__':
