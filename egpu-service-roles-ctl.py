@@ -154,14 +154,20 @@ def parse_roles(text):
     return [tuple(numbers[1 + 4 * i: 5 + 4 * i]) for i in range(numbers[0])]
 
 
-def systemctl_show(scope, unit, prop, runner=run, user="keefeere"):
-    if scope == "system":
-        command = ["systemctl", "show", unit, "-p", prop, "--value"]
+def unit_cgroup_dir(spec, cgroup_root=Path("/sys/fs/cgroup")):
+    """Current cgroup directory of a unit, found in the cgroup tree (no sessions, no PAM).
+    System units live in system.slice; user units under the user manager's subtree."""
+    unit = spec["unit"]
+    if spec["scope"] == "system":
+        candidates = [cgroup_root / "system.slice" / unit]
     else:
-        command = ["runuser", "-u", user, "--", "env", "XDG_RUNTIME_DIR=/run/user/1000",
-                   "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
-                   "systemctl", "--user", "show", unit, "-p", prop, "--value"]
-    return runner(command).stdout.strip()
+        uid = spec["uid"]
+        manager = cgroup_root / f"user.slice/user-{uid}.slice/user@{uid}.service"
+        candidates = sorted(manager.glob(f"*/{unit}")) if manager.is_dir() else []
+    candidates = [c for c in candidates if c.is_dir()]
+    if len(candidates) > 1:
+        raise RuntimeError(f"{unit}: ambiguous cgroup {candidates}")
+    return candidates[0] if candidates else None
 
 
 def process_start(pid, proc=Path("/proc")):
@@ -175,12 +181,9 @@ def reconcile_role(spec, roles, admitted, runner=run, cgroup_root=Path("/sys/fs/
     """One role: enroll when the service has a new cgroup, admit its matching running
     processes. Returns a list of human-readable actions (empty when already in sync)."""
     actions = []
-    group = systemctl_show(spec["scope"], spec["unit"], "ControlGroup", runner)
-    if not group.startswith("/") or ".." in group.split("/"):
+    directory = unit_cgroup_dir(spec, cgroup_root)
+    if directory is None:
         return [f"{spec['unit']}: not running"]
-    directory = cgroup_root / group.lstrip("/")
-    if not directory.is_dir():
-        return [f"{spec['unit']}: cgroup directory missing"]
     index = spec["index"]
     if index >= len(roles):
         raise RuntimeError(f"role {index} is not in the catalog")

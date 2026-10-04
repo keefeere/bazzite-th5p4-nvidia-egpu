@@ -105,7 +105,8 @@ class Reconcile(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        self.cg = root / "cg/user.slice/k.service"
+        self.root = root / "cg"
+        self.cg = self.root / "user.slice/user-1000.slice/user@1000.service/session.slice/k.service"
         self.cg.mkdir(parents=True)
         self.proc = root / "proc"
         for pid, exe in (("10", "/bin/sh"), ("11", "/bin/true")):
@@ -113,8 +114,8 @@ class Reconcile(unittest.TestCase):
             os.symlink(exe, self.proc / pid / "exe")
             (self.proc / pid / "stat").write_text(f"{pid} (x) S " + " ".join(["0"] * 19) + f" {pid}000 0\n")
         (self.cg / "cgroup.procs").write_text("10\n11\n")
+        self.spec = ctl.parse_role_unit("0:user:k.service:/bin/sh:1000")
         self.calls = []
-        self.spec = ctl.parse_role_unit("0:system:k.service:/bin/sh:1000")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -122,48 +123,55 @@ class Reconcile(unittest.TestCase):
     def runner(self, cgroup_id):
         def run(args):
             self.calls.append(args)
-            if args[0] == "systemctl":
-                return done("/user.slice/k.service\n")
             if args[2] == "get-property":
                 return done(f"a(tttu) 1 5 {cgroup_id} 77 1000")
             return done("t 9" if "ReEnrollRole" in args else "")
         return run
 
-    def verbs(self):
-        return [c[-1] if "AdmitProcess" not in c else "admit:" + c[-2] for c in self.calls if c[0] == "busctl" and c[2] == "call"]
+    def go(self, admitted, cgroup_id, spec=None):
+        return ctl.reconcile([spec or self.spec], admitted, self.runner(cgroup_id),
+                             cgroup_root=self.root, proc=self.proc)
 
     def test_parse(self):
         self.assertEqual(ctl.parse_roles("a(tttu) 2 1 2 3 4 5 6 7 8"), [(1, 2, 3, 4), (5, 6, 7, 8)])
-        for bad in ("a(tttu) 2 1 2 3 4", "au 1 2", "a(tttu)"):
+        for bad in ("a(tttu) 2 1 2 3 4", "au 1 2", "a(tttu)", "a(ttuu) 1 1 2 3 4"):
             with self.assertRaises(ValueError):
                 ctl.parse_roles(bad)
         for bad in ("x", "0:user:a.service:rel:1", "0:user:a.service:/a/../b:1", "99:user:a.service:/a:1", "0:other:a.service:/a:1"):
             with self.assertRaises(ValueError):
                 ctl.parse_role_unit(bad)
 
+    def test_unit_cgroup_lookup(self):
+        self.assertEqual(ctl.unit_cgroup_dir(self.spec, self.root), self.cg)
+        other = self.root / "user.slice/user-1000.slice/user@1000.service/app.slice/k.service"
+        other.mkdir(parents=True)
+        with self.assertRaises(RuntimeError):
+            ctl.unit_cgroup_dir(self.spec, self.root)
+        system = ctl.parse_role_unit("0:system:z.service:/bin/sh:0")
+        self.assertIsNone(ctl.unit_cgroup_dir(system, self.root))
+        (self.root / "system.slice/z.service").mkdir(parents=True)
+        self.assertEqual(ctl.unit_cgroup_dir(system, self.root), self.root / "system.slice/z.service")
+
     def test_new_cgroup_enrolls_then_admits_only_matching_exe(self):
         admitted = set()
-        actions = ctl.reconcile([self.spec], admitted, self.runner(cgroup_id=1),
-                                cgroup_root=Path(self.tmp.name) / "cg", proc=self.proc)
+        actions = self.go(admitted, cgroup_id=1)
         self.assertTrue(any("enrolled role 0" in a for a in actions))
         self.assertEqual([a for a in actions if "admitted" in a], ["k.service: admitted pid 10"])
         self.assertEqual(len(admitted), 1)
 
     def test_in_sync_role_does_nothing_and_admission_is_not_repeated(self):
-        ino = (Path(self.tmp.name) / "cg/user.slice/k.service").stat().st_ino
+        ino = self.cg.stat().st_ino
         admitted = set()
-        first = ctl.reconcile([self.spec], admitted, self.runner(ino), cgroup_root=Path(self.tmp.name) / "cg", proc=self.proc)
+        first = self.go(admitted, ino)
         self.assertFalse(any("enrolled" in a for a in first))
-        second = ctl.reconcile([self.spec], admitted, self.runner(ino), cgroup_root=Path(self.tmp.name) / "cg", proc=self.proc)
-        self.assertEqual(second, [])
+        self.assertEqual(self.go(admitted, ino), [])
 
     def test_stopped_unit_and_bad_role_index(self):
-        def stopped(args):
-            return done("\n") if args[0] == "systemctl" else done("a(tttu) 1 5 1 77 1000")
-        self.assertEqual(ctl.reconcile([self.spec], set(), stopped), ["k.service: not running"])
-        spec = ctl.parse_role_unit("3:system:k.service:/bin/sh:1000")
+        stopped = ctl.parse_role_unit("0:user:absent.service:/bin/sh:1000")
+        self.assertEqual(self.go(set(), 1, stopped), ["absent.service: not running"])
+        bad = ctl.parse_role_unit("3:user:k.service:/bin/sh:1000")
         with self.assertRaises(RuntimeError):
-            ctl.reconcile([spec], set(), self.runner(1), cgroup_root=Path(self.tmp.name) / "cg", proc=self.proc)
+            self.go(set(), 1, bad)
 
 
 if __name__ == "__main__":
