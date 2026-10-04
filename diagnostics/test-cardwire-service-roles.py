@@ -128,12 +128,16 @@ def llama_snapshot(proc=Path('/proc'), run_user=user_systemctl):
 def llama_run_command(snapshot, ctl):
     """systemd-run line: a SYSTEM unit as the user, enrolled by a root ExecStartPre BEFORE exec."""
     enroll = (f'+/usr/bin/python3 {ctl} enroll 0 {LLAMA_TRANSIENT}.service --exe {snapshot["exe"]}')
-    command = ['systemd-run', '--quiet', '--unit=' + LLAMA_TRANSIENT, '--uid=' + LLAMA_USER,
+    # init_t may not execute a binary labelled gconf_home_t (seen on the host: 203/EXEC,
+    # AVC execute denied), so a system unit execs /usr/bin/setpriv, which drops to the
+    # user and then execs llama. The exec hook still sees the user's uid and llama's inode.
+    command = ['systemd-run', '--quiet', '--unit=' + LLAMA_TRANSIENT,
                '--property=Type=exec', '--property=Restart=no',
                '--property=WorkingDirectory=' + snapshot['cwd'],
                '--property=ExecStartPre=' + enroll]
     command += [f'--setenv={key}={value}' for key, value in sorted(snapshot['env'].items())]
-    return command + ['--', snapshot['exe'], *snapshot['argv'][1:]]
+    return command + ['--', '/usr/bin/setpriv', f'--reuid={LLAMA_USER}', f'--regid={LLAMA_USER}',
+                      '--init-groups', '--', snapshot['exe'], *snapshot['argv'][1:]]
 
 
 def nvidia_fds(unit, root=Path('/sys/fs/cgroup/system.slice')):
@@ -168,6 +172,7 @@ def llama_flow(before):
     (ROOT / 'llama-stopped').touch()
     apply_profile('work-nvidia')
     snapshot = json.loads((ROOT / 'llama.json').read_text())
+    subprocess.run(['systemctl', 'reset-failed', LLAMA_TRANSIENT + '.service'], capture_output=True)
     base.run(llama_run_command(snapshot, ROOT / 'helpers/egpu-service-roles-ctl.py'))
     wait_port(LLAMA_PORT, 120)
     held = nvidia_fds(LLAMA_TRANSIENT)
@@ -211,6 +216,7 @@ def restore():
         llama_mode = (ROOT / 'llama-stopped').exists()
         if llama_mode:
             subprocess.run(['systemctl', 'stop', LLAMA_TRANSIENT + '.service'], timeout=100)
+            subprocess.run(['systemctl', 'reset-failed', LLAMA_TRANSIENT + '.service'], capture_output=True)
             if user_systemctl('show', 'llama.service', '-p', 'ActiveState', '--value') != 'active':
                 user_systemctl('start', 'llama.service')
         if (ROOT / 'activation-started').exists():

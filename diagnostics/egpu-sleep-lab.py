@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""One explicit freezer/devices/platform eGPU PM test; never launched by check.
+"""One explicit eGPU PM test, or --graphics-only logout/restart without sleep.
 
 Run on the host as root. No permanent unit, module option or kernel argument is
 installed. A copied worker in a transient system service owns the experiment.
@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -26,11 +27,17 @@ LOCK = Path("/run/egpu-sleep-lab.lock")
 SLEEP_CONF = Path("/run/systemd/sleep.conf.d/zzzz-egpu-sleep-lab.conf")
 UNIT_CONF = Path("/run/systemd/system/systemd-suspend.service.d/zzzz-egpu-sleep-lab.conf")
 PM_TEST = Path("/sys/power/pm_test")
+PM_ASYNC = Path('/sys/power/pm_async')
+PM_TRACE = Path('/sys/power/pm_trace')
 SLEEP_GUARD = Path("/etc/egpu-nvidia/egpu-sleep-guard.sh")
 SLEEP_GUARD_ONCE = Path("/run/egpu-sleep-guard-platform-once")
 HOST_RESET = Path("/sys/module/thunderbolt/parameters/host_reset")
 CMDLINE = Path("/proc/cmdline")
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+CARDWIRE_MASK = Path("/run/systemd/system/cardwired.service")
+PROC_ROOT = Path("/proc")
+NO_GRAPHICS_CHECK = Path("/etc/egpu-nvidia/egpu-no-graphics-check.py")
+TRANSITION_LOCK = Path("/run/egpu-nvidia-transition.lock")
 DEPTH = Path("/proc/driver/nvidia/suspend_depth")
 FLAGS = (Path("/sys/power/pm_debug_messages"), Path("/sys/power/pm_print_times"))
 SLEEP_UNITS = ("systemd-suspend.service", "systemd-hibernate.service",
@@ -42,6 +49,15 @@ LOGIN1 = ("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.
 SUSPEND_REQUEST = ["busctl", "--system", "--allow-interactive-authorization=no",
                    "call", *LOGIN1, "SuspendWithFlags", "t", "1"]
 TEST_STAGES = ("freezer", "devices", "platform")
+SERIAL_MODE = 'vram-tmpfs-serial'
+RTC_MODE = 'vram-tmpfs-serial-rtc'
+SERIAL_MODES = (SERIAL_MODE, RTC_MODE)
+PRIVATE_VRAM_MODES = ('vram-tmpfs', *SERIAL_MODES)
+VRAM_MODES = ('vram-current', *PRIVATE_VRAM_MODES)
+VRAM_CHECK = Path('/etc/egpu-nvidia/egpu-vram-backing-check.py')
+PROCFS_PM_ACTIVE = Path('/run/egpu-nvidia-procfs-pm-boot')
+PROCFS_PM_HOOK = Path('/etc/egpu-nvidia/egpu-nvidia-procfs-pm.py')
+PROCFS_PM_MARKER_OWNER = 0
 
 
 def validate_stage(stage):
@@ -69,6 +85,36 @@ def selected(text):
     return match.group(1)
 
 
+def nvidia_pm_mode(params, boot_id):
+    """Accept the normal notifier path or exactly our paired one-boot procfs path."""
+    notifier = re.findall(r'^UseKernelSuspendNotifiers:\s*([01])\s*$', params, re.M)
+    if len(notifier) != 1:
+        raise RuntimeError('NVIDIA PM notifier mode is missing or ambiguous.')
+    active = PROCFS_PM_ACTIVE.exists() or PROCFS_PM_ACTIVE.is_symlink()
+    if notifier[0] == '1':
+        if active:
+            raise RuntimeError('Procfs PM boot marker exists but NVIDIA still uses kernel notifiers.')
+        return 'kernel-notifier'
+    if not active or PROCFS_PM_ACTIVE.is_symlink() or not PROCFS_PM_ACTIVE.is_file():
+        raise RuntimeError('NVIDIA notifier is disabled without a valid procfs PM boot marker.')
+    stat = PROCFS_PM_ACTIVE.stat()
+    if (stat.st_uid != PROCFS_PM_MARKER_OWNER or stat.st_mode & 0o777 != 0o600
+            or PROCFS_PM_ACTIVE.read_text().strip() != boot_id):
+        raise RuntimeError('NVIDIA procfs PM boot marker is stale or unsafe.')
+    if not PROCFS_PM_HOOK.is_file():
+        raise RuntimeError('Paired NVIDIA procfs PM hook is not installed.')
+    pre = require_command(['systemctl', 'show', 'systemd-suspend.service', '-p', 'ExecStartPre', '--value'])
+    post = require_command(['systemctl', 'show', 'systemd-suspend.service', '-p', 'ExecStopPost', '--value'])
+    guard_entry = f'argv[]=/usr/bin/bash {SLEEP_GUARD} systemd-suspend.service ; ignore_errors=no'
+    pre_entry = f'argv[]=/usr/bin/python3 {PROCFS_PM_HOOK} pre ; ignore_errors=no'
+    post_entry = f'argv[]=/usr/bin/python3 {PROCFS_PM_HOOK} post ; ignore_errors=no'
+    guard_at = pre.find(guard_entry)
+    procfs_at = pre.find(pre_entry)
+    if guard_at < 0 or procfs_at <= guard_at or post_entry not in post:
+        raise RuntimeError('NVIDIA procfs PM hook is missing, ignored or ordered before the sleep guard.')
+    return 'paired-procfs'
+
+
 def parse_compute_clients(text):
     """Return GPU compute/UVM clients other than the compositor."""
     clients = []
@@ -82,6 +128,20 @@ def parse_compute_clients(text):
         if Path(name).name != "kwin_wayland":
             clients.append((pid.strip(), name))
     return clients
+
+
+def compute_client_summary(clients):
+    # Recent NVML output may contain a whole command line. This is display-only:
+    # do not treat slashes in arguments (e.g. --render-node=/dev/dri/...) as the
+    # executable or disclose the application's full arguments in the error.
+    labels = []
+    for pid, name in clients[:8]:
+        token = name.split(maxsplit=1)[0] if name.strip() else 'unknown'
+        label = re.sub(r'[^\w.+-]', '?', Path(token).name)[:64] or 'unknown'
+        labels.append(f'{pid}:{label}')
+    if len(clients) > 8:
+        labels.append(f'+{len(clients) - 8} more')
+    return ', '.join(labels)
 
 
 def unit_state(unit):
@@ -118,9 +178,40 @@ def definitive_rejection(output):
             or "Please retry operation after closing inhibitors and logging out other users." in output)
 
 
-def unit_override(folder):
-    return ("[Service]\nEnvironment=SYSTEMD_LOG_LEVEL=debug\n"
-            f"ExecStopPost=/usr/bin/python3 {folder / 'worker.py'} _complete\n")
+def unit_override(folder, experiment=None):
+    override = ("[Service]\nEnvironment=SYSTEMD_LOG_LEVEL=debug\n"
+                f"ExecStopPost=/usr/bin/python3 {folder / 'worker.py'} _complete\n")
+    if experiment == "no-graphics":
+        # The packaged DisplayLink hook writes to FIFOs even with its daemon
+        # stopped. Replace only this unit's view, never the host's /usr file.
+        override += "BindReadOnlyPaths=/usr/bin/true:/usr/lib/systemd/system-sleep/displaylink\n"
+    if experiment in PRIVATE_VRAM_MODES:
+        override += 'TemporaryFileSystem=' + vram_module().TMPFS + '\n'
+    return override
+
+
+def vram_module():
+    path = Path(__file__).resolve().parent / 'egpu_vram_backing.py'
+    spec = importlib.util.spec_from_file_location('egpu_vram_backing', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def no_graphics_module():
+    path = Path(__file__).resolve().parent / 'egpu_no_graphics.py'
+    spec = importlib.util.spec_from_file_location('egpu_no_graphics', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def trace_module():
+    path = Path(__file__).resolve().parent / 'egpu_pm_trace.py'
+    spec = importlib.util.spec_from_file_location('egpu_pm_trace', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def wait_for_cycle(baseline, timeout=120, completion=None):
@@ -211,17 +302,74 @@ def exact_cmdline_argument(name, value):
         raise RuntimeError(f"Expected exactly one {expected} kernel argument; found {named or 'none'}.")
 
 
-def validate_guard_bypass(stage):
-    if stage != "platform":
+def validate_cardwire_off():
+    if not CARDWIRE_MASK.is_symlink() or os.readlink(CARDWIRE_MASK) != "/dev/null":
+        raise RuntimeError("Cardwire must be runtime-masked for this diagnostic.")
+    if unit_state("cardwired.service").get("ActiveState") != "inactive":
+        raise RuntimeError("Cardwire must be inactive for this diagnostic.")
+    for task in PROC_ROOT.glob("[0-9]*/comm"):
+        try:
+            if task.read_text().strip() == "cardwired":
+                raise RuntimeError("A cardwired process is still running.")
+        except FileNotFoundError:
+            # A process may exit while the read-only snapshot is taken.
+            continue
+
+
+def validate_guard_bypass(stage, experiment="host-reset", *, preparing=False):
+    if experiment in VRAM_MODES:
+        helper = vram_module()
+        if stage not in helper.STAGES:
+            raise RuntimeError('Backing-store diagnostics allow only freezer/devices/platform; no full sleep.')
+        if experiment in SERIAL_MODES:
+            if stage != 'platform':
+                raise RuntimeError('Serial device-PM comparison requires an explicit platform test.')
+            helper.check_device_policy(experiment, preparing=True)
+        helper.check_host()
+        helper.check_service_policy(sys.modules[__name__])
+        helper.check_current_mount()
+        if helper.MARKER.exists() or helper.MARKER.is_symlink():
+            raise RuntimeError('A stale backing-store exception exists; inspect before testing.')
+        if VRAM_CHECK.is_symlink() or not VRAM_CHECK.is_file():
+            raise RuntimeError('Install the backing-store checker before this diagnostic.')
+        status = VRAM_CHECK.stat()
+        if (status.st_uid != 0 or status.st_mode & 0o022
+                or VRAM_CHECK.read_bytes() != Path(helper.__file__).read_bytes()):
+            raise RuntimeError('Installed backing-store checker is unsafe or differs; reinstall the guard.')
+    elif stage != "platform":
         raise RuntimeError("The sleep-guard bypass is valid only for the explicit platform test.")
-    for name, value in (("thunderbolt.host_reset", "0"),
-                        ("egpu.host_reset_test", "1"),
-                        ("egpu.host_reset_nodock", "1")):
-        exact_cmdline_argument(name, value)
-    if HOST_RESET.read_text().strip() != "N":
-        raise RuntimeError("The live Thunderbolt host_reset value is not N.")
+    if experiment == "host-reset":
+        for name, value in (("thunderbolt.host_reset", "0"),
+                            ("egpu.host_reset_test", "1"),
+                            ("egpu.host_reset_nodock", "1")):
+            exact_cmdline_argument(name, value)
+        if HOST_RESET.read_text().strip() != "N":
+            raise RuntimeError("The live Thunderbolt host_reset value is not N.")
+    elif experiment in ("cardwire-off", "no-graphics"):
+        if HOST_RESET.read_text().strip() != "Y" or any(
+                token.split("=", 1)[0] in ("thunderbolt.host_reset", "egpu.host_reset_test", "egpu.host_reset_nodock")
+                for token in CMDLINE.read_text().split()):
+            raise RuntimeError("This diagnostic requires the normal host_reset=Y boot, without A/B arguments.")
+        if experiment == "cardwire-off":
+            validate_cardwire_off()
+        else:
+            if NO_GRAPHICS_CHECK.is_symlink() or not NO_GRAPHICS_CHECK.is_file():
+                raise RuntimeError("Install the no-graphics checker before this diagnostic.")
+            status = NO_GRAPHICS_CHECK.stat()
+            if status.st_uid != 0 or status.st_mode & 0o022:
+                raise RuntimeError("The installed no-graphics checker must be root-owned and not writable by others.")
+            if not preparing:
+                require_command(['/usr/bin/python3', str(NO_GRAPHICS_CHECK)])
+    elif experiment not in VRAM_MODES:
+        raise RuntimeError("Unknown sleep-guard diagnostic.")
     if not SLEEP_GUARD.is_file() or SLEEP_GUARD.is_symlink():
         raise RuntimeError("The installed eGPU sleep guard is missing or is a symlink.")
+    if experiment == "cardwire-off" and "EGPU_SLEEP_GUARD_CARDWIRE_OFF_V1" not in SLEEP_GUARD.read_text():
+        raise RuntimeError("Install the Cardwire-aware sleep guard before this diagnostic.")
+    if experiment == "no-graphics" and "EGPU_SLEEP_GUARD_NO_GRAPHICS_V1" not in SLEEP_GUARD.read_text():
+        raise RuntimeError("Install the no-graphics sleep guard before this diagnostic.")
+    if experiment in VRAM_MODES and 'EGPU_SLEEP_GUARD_VRAM_STAGES_V4' not in SLEEP_GUARD.read_text():
+        raise RuntimeError('Install the backing-store-aware sleep guard before this diagnostic.')
     exec_pre = require_command(["systemctl", "show", "systemd-suspend.service",
                                 "-p", "ExecStartPre", "--value"])
     if f"{SLEEP_GUARD} systemd-suspend.service" not in exec_pre:
@@ -239,12 +387,12 @@ def validate_guard_bypass(stage):
         raise RuntimeError(f"A stale one-shot sleep marker exists: {SLEEP_GUARD_ONCE}")
 
 
-def arm_guard_platform_once(folder):
-    validate_guard_bypass("platform")
+def arm_guard_platform_once(folder, experiment="host-reset"):
+    validate_guard_bypass("platform", experiment)
     if selected(PM_TEST.read_text()) != "platform":
         raise RuntimeError("Refusing to arm an exception without pm_test=platform.")
     boot_id = BOOT_ID.read_text().strip()
-    payload = f"{boot_id}\nplatform\n".encode()
+    payload = (f"{boot_id}\nplatform\n" + (experiment + "\n" if experiment != "host-reset" else "")).encode()
     descriptor = os.open(SLEEP_GUARD_ONCE,
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                          0o600)
@@ -260,13 +408,14 @@ def arm_guard_platform_once(folder):
         if status.st_uid != 0 or status.st_mode & 0o777 != 0o600:
             raise RuntimeError("One-shot sleep marker ownership or mode is unsafe.")
         (folder / "sleep-guard-bypass.txt").write_text(
-            "Armed one platform-only invocation for this boot; the guard consumes it before systemd-sleep.\n")
+            f"Armed one {experiment} platform-only invocation for this boot; "
+            "the guard consumes it before systemd-sleep.\n")
     except BaseException:
         SLEEP_GUARD_ONCE.unlink(missing_ok=True)
         raise
 
 
-def preflight(stage="freezer", guard_bypass=False):
+def preflight(stage="freezer", guard_bypass=False, *, preparing=False):
     validate_stage(stage)
     if os.geteuid() != 0:
         raise RuntimeError("Run check/run on the host with sudo, outside the agent sandbox.")
@@ -277,8 +426,7 @@ def preflight(stage="freezer", guard_bypass=False):
     if "default" not in DEPTH.read_text().split():
         raise RuntimeError("NVIDIA suspend_depth interface is unavailable.")
     params = Path("/proc/driver/nvidia/params").read_text()
-    if not re.search(r"^UseKernelSuspendNotifiers:\s+1$", params, re.M):
-        raise RuntimeError("This experiment requires NVIDIA kernel suspend notifiers.")
+    pm_transport = nvidia_pm_mode(params, BOOT_ID.read_text().strip())
     interface = require_command(["busctl", "--system", "--xml-interface", "introspect", *LOGIN1])
     if '<method name="SuspendWithFlags">' not in interface:
         raise RuntimeError("logind SuspendWithFlags is unavailable; no unsafe fallback is used.")
@@ -298,23 +446,52 @@ def preflight(stage="freezer", guard_bypass=False):
                                "--format=csv,noheader"])
     clients = parse_compute_clients(compute)
     if clients:
-        summary = ", ".join(f"{pid}:{Path(name).name}" for pid, name in clients[:8])
-        if len(clients) > 8:
-            summary += f", +{len(clients) - 8} more"
-        raise RuntimeError("Active NVIDIA compute/UVM clients would contaminate suspend: "
-                           f"{summary}. Stop games, CUDA and Steam shader processing first.")
-    if guard_bypass:
+        raise RuntimeError("NVIDIA reports compute/UVM clients besides KWin: "
+                           f"{compute_client_summary(clients)}. This diagnostic requires them closed; "
+                           "desktop/browser apps may appear here even without a heavy workload. "
+                           "Save work and exit the listed apps normally; no sleep requested.")
+    user_session_freezer_policy = None
+    if guard_bypass == "no-graphics":
+        validate_guard_bypass(stage, guard_bypass, preparing=preparing)
+    elif guard_bypass == "cardwire-off" or guard_bypass in VRAM_MODES:
+        validate_guard_bypass(stage, guard_bypass)
+        if guard_bypass in VRAM_MODES:
+            user_session_freezer_policy = vram_module().check_service_policy(sys.modules[__name__])
+    elif guard_bypass:
         validate_guard_bypass(stage)
-    return {"kernel": os.uname().release,
+    info = {"kernel": os.uname().release,
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             "gpu": gpu.strip(), "pm_test": "none", "requested_stage": stage,
             "nvidia_depth_for_test": "default",
-            "sleep_guard_bypass": "one platform invocation" if guard_bypass else "disabled",
-            "warning": f"{stage} testing invokes NVIDIA PM notifiers and may hang the GPU or host."
+            "nvidia_pm_transport": pm_transport,
+            "sleep_guard_bypass": f"one {stage} invocation" if guard_bypass else "disabled",
+            "experiment": guard_bypass if guard_bypass in ("cardwire-off", "no-graphics", *VRAM_MODES) else
+                          ("host-reset" if guard_bypass else "unmodified"),
+            "warning": f"{stage} testing invokes the NVIDIA {pm_transport} PM path and may hang the GPU or host."
                        + (" Devices will be suspended/resumed; stack capture may be frozen too."
                           if stage in ("devices", "platform") else "")
                        + (" Late/noirq and platform callbacks will run, but not the s2idle wait loop."
                           if stage == "platform" else "")}
+    if guard_bypass == 'no-graphics' and preparing:
+        info['logout_plan'] = no_graphics_module().plan(sys.modules[__name__])
+        info['warning'] += ' Running this test ends the configured graphical session; save all work.'
+    if guard_bypass in VRAM_MODES:
+        info['backing_store'] = ('private 6 GiB tmpfs, huge=never, noswap' if guard_bypass in PRIVATE_VRAM_MODES
+                                 else 'unchanged host /var/tmp (Btrfs)')
+        info['user_session_freezer_policy'] = user_session_freezer_policy
+        info['warning'] += ' Session stays running, but a hang may still require forced reboot. No automatic retry.'
+    if guard_bypass in SERIAL_MODES:
+        info['device_pm'] = 'one serial device-callback test (pm_async: 1 -> 0 -> restore)'
+    if guard_bypass == RTC_MODE:
+        config = Path('/usr/lib/modules') / os.uname().release / 'config'
+        if not config.is_file() or 'CONFIG_PM_TRACE_RTC=y' not in config.read_text().splitlines():
+            raise RuntimeError('RTC PM tracing is not supported by this exact kernel.')
+        if PM_TRACE.read_text().strip() != '0':
+            raise RuntimeError('RTC PM tracing must be off before this diagnostic.')
+        info['rtc_fingerprint'] = ('One platform-only PM fingerprint in RTC memory. This overwrites RTC clock data; '
+                                   'wall-clock time may be wrong until NTP resynchronizes. It is not a sleep fix.')
+        info['warning'] += ' RTC contents will change; forced reboot may be needed after a hang.'
+    return info
 
 
 def save_command(path, argv, timeout=10):
@@ -342,6 +519,10 @@ def snapshot(folder, phase):
     dest = folder / phase
     dest.mkdir(mode=0o700, exist_ok=True)
     for name, path in (("nvidia-params", "/proc/driver/nvidia/params"),
+                       ("pm-async", "/sys/power/pm_async"),
+                       ("pm-trace", "/sys/power/pm_trace"),
+                       ("cmdline", "/proc/cmdline"),
+                       ("host-reset", "/sys/module/thunderbolt/parameters/host_reset"),
                        ("acpi-wakeup", "/proc/acpi/wakeup"),
                        ("nvidia-power", "/proc/driver/nvidia/gpus/0000:03:00.0/power"),
                        ("meminfo", "/proc/meminfo"),
@@ -353,31 +534,98 @@ def snapshot(folder, phase):
             copy_text(path, dest / ("pm-stat-" + path.name + ".txt"))
     save_command(dest / "processes.txt", ["ps", "-eo", "pid,ppid,stat,wchan:40,comm"])
     save_command(dest / "sleep-unit.txt", ["systemctl", "show", "systemd-suspend.service"])
+    save_command(dest / "cardwire-unit.txt", ["systemctl", "show", "cardwired.service",
+                                              "-p", "ActiveState", "-p", "SubState",
+                                              "-p", "UnitFileState", "-p", "MainPID"])
     save_command(dest / "kernel.txt", ["journalctl", "-k", "-b", "--no-pager", "-n", "180",
                                         "-o", "short-monotonic"])
 
 
-def dump_stacks(folder, index):
-    # Read tasks directly; avoid GPU ioctls/NVML polling during the transition.
-    chunks = []
-    for proc in Path("/proc").glob("[0-9]*"):
+def stack_candidates(focused=False):
+    """Put the PM caller first, before potentially numerous NVIDIA threads."""
+    candidates = []
+    for proc in PROC_ROOT.glob("[0-9]*"):
         try:
             name = (proc / "comm").read_text().strip()
-            state = (proc / "status").read_text()
-            blocked = re.search(r"^State:\s+D\b", state, re.M)
-            if not blocked and not name.startswith(("systemd-sleep", "nvidia", "kwin_wayland",
-                                                    "cardwired", "DisplayLink")):
+            if name == "systemd-sleep":
+                priority = 0
+            elif focused:
                 continue
-            chunks.append(f"\nPID {proc.name} {name}\n")
-            for task in (proc / "task").glob("[0-9]*"):
-                try:
-                    chunks.append(f"TID {task.name}: {(task / 'comm').read_text().strip()}\n")
-                    chunks.append((task / "stack").read_text())
-                except OSError as exc:
-                    chunks.append(f"[stack unavailable: {exc}]\n")
+            elif name.startswith(("nvidia", "kwin_wayland", "cardwired", "DisplayLink")):
+                priority = 1
+            elif re.search(r"^State:\s+D\b", (proc / "status").read_text(), re.M):
+                priority = 2
+            else:
+                continue
+            candidates.append((priority, int(proc.name), proc, name))
         except OSError:
             continue
-    (folder / f"stacks-{index}.txt").write_text("".join(chunks))
+    return [(proc, name) for _, _, proc, name in sorted(candidates)]
+
+
+def capture_task_context(task, persist):
+    # ORC can refuse to unwind a task running on another CPU. Save independent
+    # scheduler observations before trying the stack, without stopping the task
+    # or issuing a GPU ioctl. These reads are NOT an atomic task snapshot.
+    status_fields = {'Name', 'State', 'Tgid', 'Pid', 'PPid', 'TracerPid',
+                     'voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches'}
+    for name in ('status', 'wchan', 'schedstat'):
+        stamp = time.monotonic()
+        try:
+            value = (task / name).read_text().strip()
+            if name == 'status':
+                value = '\n'.join(line for line in value.splitlines()
+                                  if line.partition(':')[0] in status_fields)
+            persist(f'{name}: sample_monotonic={stamp:.6f}\n'
+                    + (value or '[empty observation; not evidence of completion]') + '\n')
+        except OSError as exc:
+            persist(f'[{name} unavailable at {stamp:.6f}: {exc}]\n')
+
+
+def capture_stacks(folder, index, focused=False):
+    # No GPU ioctls/NVML or PM writes. Flush each task before reading the next;
+    # a stalled later read must not discard already collected PM evidence.
+    path = folder / f"stacks-{index}.txt"
+    with path.open("x") as stream:
+        def persist(text):
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        persist(f"monotonic={time.monotonic():.6f} focused={focused}\n"
+                "Userspace sampling only; no capture is guaranteed after freezing.\n"
+                "Task context reads are non-atomic; wchan=0 or an empty stack is inconclusive.\n")
+        candidates = stack_candidates(focused)
+        if not candidates:
+            persist("[no matching process observed; PM stage cannot be inferred]\n")
+        for proc, name in candidates:
+            persist(f"\nPID {proc.name} {name}\n")
+            if name == 'systemd-sleep':
+                try:
+                    persist('mount_namespace=' + os.readlink(proc / 'ns/mnt') + '\n')
+                    for line in (proc / 'mountinfo').read_text().splitlines():
+                        fields = line.split()
+                        if len(fields) > 4 and fields[4] == '/var/tmp':
+                            persist('backing_mount=' + line + '\n')
+                except OSError as exc:
+                    persist(f'[mount evidence unavailable: {exc}]\n')
+            for task in sorted((proc / "task").glob("[0-9]*"), key=lambda p: int(p.name)):
+                persist(f"TID {task.name}: sample_monotonic={time.monotonic():.6f}\n")
+                capture_task_context(task, persist)
+                persist(f"stack_sample_monotonic={time.monotonic():.6f}\n")
+                try:
+                    stack = (task / "stack").read_text()
+                    persist(stack if stack else "[empty kernel stack; not a completion signal]\n")
+                except OSError as exc:
+                    persist(f"[stack unavailable: {exc}]\n")
+
+
+def dump_stacks(folder, index, focused=False):
+    capture_stacks(folder, index, focused)
+    if focused:
+        # Keep early probes small: no all-thread sweep, sysrq, global sync,
+        # systemctl, journal query or GPU access on the pre-freezer path.
+        return
     # 'w' only dumps blocked tasks. No reset, kill, or power action is issued.
     try:
         Path("/proc/sysrq-trigger").write_text("w")
@@ -390,12 +638,19 @@ def dump_stacks(folder, index):
 
 
 def observer(folder, done):
-    # These delays measure elapsed execution; freezing pauses this process too.
-    for index, delay in enumerate((15, 30), 1):
-        if done.wait(delay):
+    # Deadlines are relative to observer start; captures themselves take time.
+    # This process freezes too and is not a watchdog. Check done before capture
+    # even if a deadline elapsed while this process was unable to run.
+    started = time.monotonic()
+    for index, offset, focused in (("early-1", 2, True), ("early-2", 6, True),
+                                   (1, 15, False), (2, 45, False)):
+        if done.wait(max(0, started + offset - time.monotonic())):
             return
         print(f"Delayed stack capture {index}: transition has not completed.", flush=True)
-        dump_stacks(folder, index)
+        try:
+            dump_stacks(folder, index, focused=focused)
+        except OSError as exc:
+            print(f"Stack capture {index} unavailable: {exc}", flush=True)
 
 
 def create_override(path, text):
@@ -423,7 +678,16 @@ def label_overrides(paths):
 def finish_settings(saved, owned):
     # Restore only once the requested cycle has finished (or before requesting).
     errors = []
-    actions = [(DEPTH, "default"), (PM_TEST, saved["pm_test"])]
+    actions = [(DEPTH, "default")]
+    if 'pm_async' in saved:
+        if saved['pm_async'] not in ('0', '1'):
+            raise RuntimeError('Unexpected saved pm_async value; refusing restoration.')
+        actions.append((PM_ASYNC, saved['pm_async']))
+    if 'pm_trace' in saved:
+        if saved['pm_trace'] != '0':
+            raise RuntimeError('Unexpected saved pm_trace value; refusing restoration.')
+        actions.append((PM_TRACE, saved['pm_trace']))
+    actions.append((PM_TEST, saved['pm_test']))
     actions.extend((Path(path), value) for path, value in saved["flags"].items())
     for path, value in actions:
         try:
@@ -460,7 +724,7 @@ def cleanup_rejected(folder):
         if any(value not in ("0", "1") for value in saved["flags"].values()):
             raise RuntimeError("Unexpected saved PM logging value.")
         expected = {SLEEP_CONF: "[Sleep]\nSuspendState=\nSuspendState=mem\n",
-                    UNIT_CONF: unit_override(folder)}
+                    UNIT_CONF: unit_override(folder, saved.get('experiment'))}
         for path, content in expected.items():
             if path.is_symlink() or path.read_text() != content:
                 raise RuntimeError(f"Override does not belong to this run: {path}")
@@ -472,30 +736,52 @@ def cleanup_rejected(folder):
         print("Rejected request cleaned up. No sleep or reboot requested.", flush=True)
 
 
-def worker(folder, stage="freezer", guard_bypass=False):
+def worker(folder, stage="freezer", guard_bypass=False, *, kernel_trace=False):
     validate_stage(stage)
     with LOCK.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return experiment(folder, stage, guard_bypass)
+        if guard_bypass in ('no-graphics', 'graphics-only'):
+            if kernel_trace:
+                raise RuntimeError('Kernel tracing is restricted to session-intact PM tests.')
+            if guard_bypass == 'no-graphics' and stage != 'platform':
+                raise RuntimeError('The no-graphics test is platform-only.')
+            with TRANSITION_LOCK.open('a') as transition:
+                fcntl.flock(transition, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return no_graphics_module().run(sys.modules[__name__], folder,
+                                               graphics_only=guard_bypass == 'graphics-only')
+        return experiment(folder, stage, guard_bypass, kernel_trace=kernel_trace)
 
 
-def experiment(folder, stage="freezer", guard_bypass=False):
+def experiment(folder, stage="freezer", guard_bypass=False, *, kernel_trace=False):
     validate_stage(stage)
     info = preflight(stage, guard_bypass)
     saved = {"pm_test": selected(PM_TEST.read_text()),
              "flags": {str(path): path.read_text().strip() for path in FLAGS}}
+    if guard_bypass in SERIAL_MODES:
+        saved['pm_async'] = PM_ASYNC.read_text().strip()
+        if saved['pm_async'] != '1':
+            raise RuntimeError('Serial comparison expects an unchanged pm_async=1 baseline.')
+    if guard_bypass == RTC_MODE:
+        saved['pm_trace'] = PM_TRACE.read_text().strip()
+        if saved['pm_trace'] != '0':
+            raise RuntimeError('RTC PM tracing must start disabled.')
     (folder / "before.json").write_text(json.dumps({**info, **saved}, indent=2))
     owned = []
     request_may_be_pending = False
     cycle_finished = False
     done = threading.Event()
     thread = None
+    capture = None
     started_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     try:
         snapshot(folder, "before")
+        if kernel_trace:
+            capture = trace_module().Capture(folder)
+            # Refuse missing targets/failed marker before changing PM policy.
+            capture.start()
         create_override(SLEEP_CONF, "[Sleep]\nSuspendState=\nSuspendState=mem\n")
         owned.append(SLEEP_CONF)
-        create_override(UNIT_CONF, unit_override(folder))
+        create_override(UNIT_CONF, unit_override(folder, guard_bypass))
         owned.append(UNIT_CONF)
         label_overrides(owned)
         require_command(["systemctl", "daemon-reload"])
@@ -513,7 +799,19 @@ def experiment(folder, stage="freezer", guard_bypass=False):
         if selected(PM_TEST.read_text()) != stage:
             raise RuntimeError(f"Kernel did not accept the {stage}-only test.")
         DEPTH.write_text("default\n")
-        if guard_bypass:
+        if guard_bypass in SERIAL_MODES:
+            PM_ASYNC.write_text('0\n')
+            if PM_ASYNC.read_text().strip() != '0':
+                raise RuntimeError('Kernel did not accept serial device PM; no sleep requested.')
+        if guard_bypass == RTC_MODE:
+            PM_TRACE.write_text('1\n')
+            if PM_TRACE.read_text().strip() != '1':
+                raise RuntimeError('Kernel did not accept RTC PM tracing; no sleep requested.')
+        if guard_bypass in VRAM_MODES:
+            vram_module().arm(folder, guard_bypass, stage=stage)
+        elif guard_bypass in ("cardwire-off", "no-graphics"):
+            arm_guard_platform_once(folder, guard_bypass)
+        elif guard_bypass:
             arm_guard_platform_once(folder)
         baseline = unit_state("systemd-suspend.service")["ExecMainStartTimestampMonotonic"]
         (folder / "request-baseline.txt").write_text(baseline + "\n")
@@ -530,6 +828,8 @@ def experiment(folder, stage="freezer", guard_bypass=False):
         os.sync()
         thread = threading.Thread(target=observer, args=(folder, done), daemon=True)
         thread.start()
+        if capture:
+            capture.ensure_running()
         # Mark pending BEFORE requesting: a timeout does not cancel a queued sleep.
         request_may_be_pending = True
         request = command(SUSPEND_REQUEST, timeout=30)
@@ -567,14 +867,25 @@ def experiment(folder, stage="freezer", guard_bypass=False):
         return 0 if passed else 1
     finally:
         done.set()
-        if guard_bypass:
+        if guard_bypass in VRAM_MODES:
+            vram_module().MARKER.unlink(missing_ok=True)
+        elif guard_bypass:
             # If ExecStartPre did not consume it, fail closed for every later request.
             SLEEP_GUARD_ONCE.unlink(missing_ok=True)
+        if capture:
+            try:
+                capture.stop()
+            except Exception as exc:
+                # Preserve the original PM outcome and always reach PM cleanup.
+                print(f'Trace cleanup failed: {exc}; inspect the private instance.', flush=True)
         cleanup_error = None
         if not request_may_be_pending or cycle_finished:
             try:
                 finish_settings(saved, owned)
-                (folder / "restored.txt").write_text("pm_test, PM logging and runtime overrides restored; NVIDIA depth=default.\n")
+                (folder / "restored.txt").write_text("pm_test, PM logging and runtime overrides restored; NVIDIA depth=default.\n"
+                    + ("pm_async restored to its saved value.\n" if 'pm_async' in saved else "")
+                    + ("pm_trace disabled; RTC wall-clock data may still need NTP resync.\n"
+                       if 'pm_trace' in saved else ""))
                 print("Temporary settings restored.", flush=True)
             except Exception as exc:
                 cleanup_error = exc
@@ -583,6 +894,10 @@ def experiment(folder, stage="freezer", guard_bypass=False):
             (folder / "reboot-clears-test.txt").write_text(
                 f"The sleep request may still be in flight. Keep pm_test={stage} and depth=default.\n"
                 "Do not request another sleep. A reboot clears these /run and driver/sysfs settings.\n"
+                + ("pm_async=0 is retained until idle-state inspection or reboot.\n"
+                   if 'pm_async' in saved else "")
+                + ("pm_trace=1 was enabled; RTC clock may be wrong after reset.\n"
+                   if 'pm_trace' in saved else "RTC tracing was not enabled.\n") +
                 "No automatic reboot or GPU reset was attempted.\n")
             print("Transition outcome uncertain: test settings retained until reboot; do not request sleep again.", flush=True)
         save_command(folder / "services.txt", ["journalctl", "-b", "--since", started_at,
@@ -595,9 +910,17 @@ def experiment(folder, stage="freezer", guard_bypass=False):
             raise cleanup_error
 
 
-def launch(stage="freezer", guard_bypass=False):
+def launch(stage="freezer", guard_bypass=False, *, kernel_trace=False):
     validate_stage(stage)
-    info = preflight(stage, guard_bypass)
+    if guard_bypass == 'graphics-only':
+        info = no_graphics_module().preflight_graphics(sys.modules[__name__])
+    else:
+        info = (preflight(stage, guard_bypass, preparing=True) if guard_bypass == 'no-graphics'
+                else preflight(stage, guard_bypass))
+    if kernel_trace:
+        if guard_bypass in ('no-graphics', 'graphics-only'):
+            raise RuntimeError('Kernel tracing is restricted to session-intact PM tests.')
+        info['kernel_trace'] = trace_module().check()
     LOG_ROOT.mkdir(mode=0o700, exist_ok=True)
     if LOG_ROOT.is_symlink() or LOG_ROOT.stat().st_uid != 0 or LOG_ROOT.stat().st_mode & 0o022:
         raise RuntimeError("Log root must be a root-owned directory, not writable by other users.")
@@ -607,12 +930,46 @@ def launch(stage="freezer", guard_bypass=False):
     worker_file = folder / "worker.py"
     shutil.copyfile(Path(__file__).resolve(), worker_file)
     worker_file.chmod(0o600)
+    if kernel_trace:
+        helper = folder / 'egpu_pm_trace.py'
+        shutil.copyfile(Path(__file__).resolve().parent / helper.name, helper)
+        helper.chmod(0o600)
+    if guard_bypass in ('no-graphics', 'graphics-only'):
+        helper = folder / 'egpu_no_graphics.py'
+        shutil.copyfile(Path(__file__).resolve().parent / helper.name, helper)
+        helper.chmod(0o600)
+    if guard_bypass in VRAM_MODES:
+        helper = folder / 'egpu_vram_backing.py'
+        shutil.copyfile(Path(__file__).resolve().parent / helper.name, helper)
+        helper.chmod(0o600)
     (folder / "preflight.json").write_text(json.dumps(info, indent=2))
     unit = "egpu-sleep-lab-" + folder.name
     (folder / "unit.txt").write_text(unit + ".service\n")
-    print(f"Stage: {stage}\nLogs: {folder}\nTransient service: {unit}.service", flush=True)
-    worker_argv = ["/usr/bin/python3", str(worker_file), "_worker", "--stage", stage]
-    if guard_bypass:
+    label = 'graphics-only (NO SLEEP)' if guard_bypass == 'graphics-only' else stage
+    print(f"Stage: {label}\nLogs: {folder}\nTransient service: {unit}.service", flush=True)
+    worker_argv = ["/usr/bin/python3", str(worker_file), "_worker"]
+    if kernel_trace:
+        worker_argv.append('--kernel-trace')
+    if guard_bypass == 'graphics-only':
+        worker_argv.extend(['--graphics-only', '--allow-logout'])
+        # Hold a block inhibitor for the entire roundtrip; the eGPU guard stays
+        # installed and no one-shot exception is created.
+        worker_argv = ['systemd-inhibit', '--what=sleep', '--mode=block',
+                       '--who=egpu-graphics-test', '--why=Graphics-only diagnostic; no sleep',
+                       *worker_argv]
+    else:
+        worker_argv.extend(['--stage', stage])
+    if guard_bypass == 'no-graphics':
+        worker_argv.extend(['--no-graphics', '--allow-logout'])
+    elif guard_bypass == "cardwire-off":
+        worker_argv.append("--cardwire-off-guard-bypass")
+    elif guard_bypass in VRAM_MODES:
+        worker_argv.extend(['--vram-backing', 'private-tmpfs' if guard_bypass in PRIVATE_VRAM_MODES else 'current'])
+        if guard_bypass in SERIAL_MODES:
+            worker_argv.append('--serial-device-pm')
+        if guard_bypass == RTC_MODE:
+            worker_argv.append('--rtc-pm-trace')
+    elif guard_bypass and guard_bypass != 'graphics-only':
         worker_argv.append("--host-reset-guard-bypass")
     result = command(["systemd-run", "--collect", "--unit=" + unit,
                       "--service-type=exec", "--property=TimeoutStopSec=15s",
@@ -627,14 +984,56 @@ def main():
     parser.add_argument("run_directory", nargs="?")
     parser.add_argument("--stage", choices=TEST_STAGES,
                         help="Explicit PM test stage; defaults to freezer. Never enables full sleep.")
-    parser.add_argument("--host-reset-guard-bypass", action="store_true",
+    bypasses = parser.add_mutually_exclusive_group()
+    bypasses.add_argument("--host-reset-guard-bypass", action="store_true",
                         help="Consume one sleep-guard exception for the explicit no-dock host_reset=0 platform test.")
+    bypasses.add_argument("--cardwire-off-guard-bypass", action="store_true",
+                         help="One platform-only test on a normal boot with Cardwire already stopped and runtime-masked.")
+    bypasses.add_argument('--no-graphics', action='store_true',
+                         help='Stop the configured graphical session, SDDM, Cardwire and DisplayLink for one platform test.')
+    bypasses.add_argument('--graphics-only', action='store_true',
+                         help='Stop and restore the same graphics services without requesting sleep or changing PM settings.')
+    bypasses.add_argument('--vram-backing', choices=('current', 'private-tmpfs'),
+                         help='One explicit freezer/devices/platform comparison with the session intact; bounded low-VRAM diagnostic, not full sleep.')
+    parser.add_argument('--serial-device-pm', action='store_true',
+                        help='One explicit platform/private-tmpfs comparison with pm_async=0; RTC tracing remains off unless separately requested.')
+    parser.add_argument('--rtc-pm-trace', action='store_true',
+                        help='Opt-in RTC fingerprint for a platform/private-tmpfs/serial test; overwrites RTC clock data and may require NTP resync.')
+    parser.add_argument('--kernel-trace', action='store_true',
+                        help='Optional isolated, bounded PM tracing; does not change the selected test or bypass the guard.')
+    parser.add_argument('--allow-logout', action='store_true',
+                        help='Required for run --no-graphics or --graphics-only; closes graphical applications.')
     args = parser.parse_args()
+    if args.kernel_trace and (args.action not in ('check', 'run', '_worker')
+                              or args.no_graphics or args.graphics_only):
+        parser.error('--kernel-trace supports only session-intact PM check/run')
     if args.stage and args.action not in ("check", "run", "_worker"):
         parser.error("--stage only applies to check/run")
     stage = args.stage or "freezer"
-    if args.host_reset_guard_bypass and (args.action not in ("check", "run", "_worker") or stage != "platform"):
-        parser.error("--host-reset-guard-bypass requires check/run --stage platform")
+    if args.serial_device_pm and (args.action not in ('check', 'run', '_worker')
+                                  or args.stage != 'platform' or args.vram_backing != 'private-tmpfs'):
+        parser.error('--serial-device-pm requires check/run --stage platform --vram-backing private-tmpfs')
+    if args.rtc_pm_trace and (not args.serial_device_pm or args.action not in ('check', 'run', '_worker')
+                              or args.stage != 'platform' or args.vram_backing != 'private-tmpfs'
+                              or args.kernel_trace):
+        parser.error('--rtc-pm-trace requires check/run --stage platform --vram-backing private-tmpfs '
+                     '--serial-device-pm, without --kernel-trace')
+    guard_bypass = (('vram-tmpfs' if args.vram_backing == 'private-tmpfs' else 'vram-current') if args.vram_backing else
+                   'graphics-only' if args.graphics_only else 'no-graphics' if args.no_graphics else
+                    ("cardwire-off" if args.cardwire_off_guard_bypass else args.host_reset_guard_bypass))
+    if args.serial_device_pm:
+        guard_bypass = RTC_MODE if args.rtc_pm_trace else SERIAL_MODE
+    ends_graphics = args.no_graphics or args.graphics_only
+    if args.allow_logout and (not ends_graphics or args.action not in ('run', '_worker')):
+        parser.error('--allow-logout is only valid for run --no-graphics or --graphics-only')
+    if ends_graphics and args.action in ('run', '_worker') and not args.allow_logout:
+        parser.error('This graphics test requires --allow-logout after saving work')
+    if args.graphics_only and (args.stage or args.action not in ('check', 'run', '_worker')):
+        parser.error('--graphics-only accepts check/run without any --stage or PM bypass')
+    if args.vram_backing and args.action not in ('check', 'run', '_worker'):
+        parser.error('--vram-backing supports only check/run with an explicit diagnostic stage (default: freezer)')
+    if guard_bypass and not args.graphics_only and not args.vram_backing and (args.action not in ("check", "run", "_worker") or stage != "platform"):
+        parser.error("A sleep-guard bypass requires check/run --stage platform")
     if args.action in ("cleanup", "_cleanup"):
         if not args.run_directory or os.geteuid() != 0:
             parser.error("cleanup needs root and an explicit diagnostic run directory")
@@ -650,11 +1049,18 @@ def main():
     if args.run_directory:
         parser.error("a run directory is only accepted for cleanup")
     if args.action == "check":
-        print(json.dumps(preflight(stage, args.host_reset_guard_bypass), indent=2))
+        if args.graphics_only:
+            info = no_graphics_module().preflight_graphics(sys.modules[__name__])
+        else:
+            info = (preflight(stage, guard_bypass, preparing=True) if args.no_graphics
+                    else preflight(stage, guard_bypass))
+        if args.kernel_trace:
+            info['kernel_trace'] = trace_module().check()
+        print(json.dumps(info, indent=2))
         print("READ-ONLY PREFLIGHT PASSED. No sleep requested and no configuration changed.")
         return 0
     if args.action == "run":
-        return launch(stage, args.host_reset_guard_bypass)
+        return launch(stage, guard_bypass, **({'kernel_trace': True} if args.kernel_trace else {}))
     folder = Path(__file__).resolve().parent
     if os.geteuid() != 0 or folder.parent != LOG_ROOT or folder.stat().st_uid != 0:
         raise RuntimeError("Worker must run from its root-owned diagnostic log directory.")
@@ -669,7 +1075,7 @@ def main():
     def interrupted(*_):
         raise InterruptedError("Worker stopped")
     signal.signal(signal.SIGTERM, interrupted)
-    return worker(folder, stage, args.host_reset_guard_bypass)
+    return worker(folder, stage, guard_bypass, kernel_trace=args.kernel_trace)
 
 
 if __name__ == "__main__":

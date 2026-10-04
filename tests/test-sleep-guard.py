@@ -49,6 +49,21 @@ class SleepGuardTests(unittest.TestCase):
     def test_absent(self):
         self.check_guard(0)
 
+    def test_freezer_marker_does_not_authorize_other_sleep_or_readonly_checks(self):
+        self.device('pci', '0000:03:00.0', vendor='0x10de', device='0x2c05')
+        marker = self.runtime / 'egpu-sleep-guard-freezer-once'
+        marker.write_text('not interpreted by these operations')
+        for unit in ('systemd-hibernate.service', 'systemd-hybrid-sleep.service',
+                     'systemd-suspend-then-hibernate.service', None):
+            with self.subTest(unit=unit):
+                self.check_guard(1, unit)
+                self.assertTrue(marker.exists())
+
+    def test_freezer_marker_has_no_fake_sysfs_success_path(self):
+        marker = self.runtime / 'egpu-sleep-guard-freezer-once'
+        marker.write_text('any content')
+        self.check_guard(2)
+
     def test_hp_dock_and_igpu_only(self):
         self.device('pci', '0000:64:00.0', vendor='0x1002', device='0x1586')
         self.device('pci', '0000:22:00.0', vendor='0x8086', device='0x0b26')
@@ -125,6 +140,122 @@ class SleepGuardTests(unittest.TestCase):
                     'thunderbolt.host_reset=0 egpu.host_reset_test=1 egpu.host_reset_nodock=1' + extra + '\n')
                 self.check_guard(2)
                 self.assertFalse(marker.exists())
+
+    def cardwire_experiment(self):
+        self.device('pci', '0000:03:00.0', vendor='0x10de', device='0x2c05')
+        (self.procfs / 'cmdline').write_text('quiet\n')
+        (self.sysfs / 'module/thunderbolt/parameters/host_reset').write_text('Y\n')
+        (self.runtime / 'systemd/system').mkdir(parents=True)
+        (self.runtime / 'systemd/system/cardwired.service').symlink_to('/dev/null')
+        (self.runtime / 'cardwire-active-state').write_text('inactive\n')
+        marker = self.runtime / 'egpu-sleep-guard-platform-once'
+        marker.write_text('test-boot\nplatform\ncardwire-off\n')
+        marker.chmod(0o600)
+        return marker
+
+    def test_cardwire_off_allows_exactly_one_platform_invocation(self):
+        marker = self.cardwire_experiment()
+        self.assertIn('cardwire-off', self.check_guard(0).stdout)
+        self.assertFalse(marker.exists())
+        self.check_guard(1)
+
+    def test_cardwire_marker_cannot_allow_hibernate_or_status_check(self):
+        marker = self.cardwire_experiment()
+        for unit in ('systemd-hibernate.service', 'systemd-hybrid-sleep.service',
+                     'systemd-suspend-then-hibernate.service', None):
+            with self.subTest(unit=unit):
+                self.check_guard(1, unit)
+                self.assertTrue(marker.exists())
+
+    def test_cardwire_off_rejects_missing_runtime_mask(self):
+        marker = self.cardwire_experiment()
+        (self.runtime / 'systemd/system/cardwired.service').unlink()
+        self.check_guard(2)
+        self.assertFalse(marker.exists())
+
+    def test_cardwire_off_rejects_active_service(self):
+        marker = self.cardwire_experiment()
+        (self.runtime / 'cardwire-active-state').write_text('active\n')
+        self.check_guard(2)
+        self.assertFalse(marker.exists())
+
+    def test_cardwire_off_rejects_unmanaged_daemon(self):
+        marker = self.cardwire_experiment()
+        (self.procfs / '123').mkdir()
+        (self.procfs / '123/comm').write_text('cardwired\n')
+        self.check_guard(2)
+        self.assertFalse(marker.exists())
+
+    def test_cardwire_off_rejects_wrong_host_reset(self):
+        self.cardwire_experiment()
+        (self.sysfs / 'module/thunderbolt/parameters/host_reset').write_text('N\n')
+        self.check_guard(2)
+
+    def test_cardwire_off_rejects_experiment_arguments(self):
+        marker = self.cardwire_experiment()
+        for token in ('thunderbolt.host_reset=1', 'egpu.host_reset_test=1', 'egpu.host_reset_nodock=1'):
+            with self.subTest(token=token):
+                marker.write_text('test-boot\nplatform\ncardwire-off\n')
+                marker.chmod(0o600)
+                (self.procfs / 'cmdline').write_text('quiet ' + token + '\n')
+                self.check_guard(2)
+                self.assertFalse(marker.exists())
+
+    def test_cardwire_off_rejects_stale_or_wrong_stage_markers(self):
+        marker = self.cardwire_experiment()
+        for payload in ('old-boot\nplatform\ncardwire-off\n', 'test-boot\nnone\ncardwire-off\n',
+                        'test-boot\nplatform\nunknown\n', 'test-boot\nplatform\ncardwire-off\nextra\n'):
+            with self.subTest(payload=payload):
+                marker.write_text(payload)
+                marker.chmod(0o600)
+                self.check_guard(2)
+                self.assertFalse(marker.exists())
+
+    def test_cardwire_off_never_allows_real_sleep(self):
+        self.cardwire_experiment()
+        self.pm_test.write_text('[none] core processors platform devices freezer\n')
+        self.check_guard(2)
+
+    def test_cardwire_off_requires_private_marker(self):
+        marker = self.cardwire_experiment()
+        marker.chmod(0o644)
+        self.check_guard(2)
+
+    def no_graphics_experiment(self):
+        marker = self.cardwire_experiment()
+        marker.write_text('test-boot\nplatform\nno-graphics\n')
+        (self.runtime / 'no-graphics-check').write_text('passed\n')
+        (self.runtime / 'displaylink-hook-isolated').write_text('yes\n')
+        return marker
+
+    def test_no_graphics_exact_marker_allows_one_invocation(self):
+        marker = self.no_graphics_experiment()
+        self.assertIn('no-graphics', self.check_guard(0).stdout)
+        self.assertFalse(marker.exists())
+        self.check_guard(1)
+
+    def test_no_graphics_requires_both_quiescence_and_hook_isolation(self):
+        marker = self.no_graphics_experiment()
+        for filename in ('no-graphics-check', 'displaylink-hook-isolated'):
+            with self.subTest(filename=filename):
+                saved = (self.runtime / filename).read_text()
+                (self.runtime / filename).write_text('failed\n')
+                marker.write_text('test-boot\nplatform\nno-graphics\n')
+                self.check_guard(2)
+                self.assertFalse(marker.exists())
+                (self.runtime / filename).write_text(saved)
+
+    def test_no_graphics_cannot_bypass_other_sleep_operations(self):
+        marker = self.no_graphics_experiment()
+        for unit in ('systemd-hibernate.service', 'systemd-hybrid-sleep.service',
+                     'systemd-suspend-then-hibernate.service', None):
+            self.check_guard(1, unit)
+            self.assertTrue(marker.exists())
+
+    def test_no_graphics_cannot_allow_full_sleep(self):
+        self.no_graphics_experiment()
+        self.pm_test.write_text('[none] core processors platform devices freezer\n')
+        self.check_guard(2)
 
 
 if __name__ == '__main__':

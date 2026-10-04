@@ -109,9 +109,12 @@ class Guards(unittest.TestCase):
         pre = [a for a in command if a.startswith('--property=ExecStartPre=')][0]
         self.assertTrue(pre.startswith('--property=ExecStartPre=+/usr/bin/python3 /run/t/helpers/ctl.py enroll 0 '))
         self.assertIn('--exe /home/u/.local/bin/llama', pre)
-        self.assertIn('--uid=keefeere', command)
+        self.assertFalse(any(a.startswith('--uid=') for a in command))  # init_t cannot exec home files
+        self.assertIn('--reuid=keefeere', command)
         self.assertIn('--setenv=CUDA_VISIBLE_DEVICES=0', command)
-        self.assertEqual(command[command.index('--') + 1:], ['/home/u/.local/bin/llama', 'serve', '--port', '9931'])
+        self.assertEqual(command[command.index('--') + 1:],
+                         ['/usr/bin/setpriv', '--reuid=keefeere', '--regid=keefeere', '--init-groups', '--',
+                          '/home/u/.local/bin/llama', 'serve', '--port', '9931'])
 
     def test_snapshot_whitelists_environment_and_exact_argv(self):
         with tempfile.TemporaryDirectory() as tmp:
