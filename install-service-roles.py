@@ -39,6 +39,8 @@ POLKIT_SRC = HERE / '49-egpu-service-roles.rules.in'
 POLKIT = Path('/etc/polkit-1/rules.d/49-egpu-service-roles.rules')
 PLASMOID_SRC = HERE / 'plasmoid/com.keefeere.egpu'
 PLASMOID_BACKUP_SUFFIX = '.pre-service-roles'
+GENERATOR_SRC = HERE / 'egpu-kwin-order-generator.sh'
+GENERATOR = Path('/etc/systemd/user-environment-generators/90-egpu-kwin-order')
 PINS = Path('/sys/fs/bpf/cardwire-service-roles')
 PIN_NAMES = ('exec_link', 'open_link', 'CW_ACTIVE', 'CW_DEVICES_MAP', 'CW_ROLE_TASKS')
 HARDWARE = Path('/etc/egpu-nvidia/hardware.conf')
@@ -132,6 +134,24 @@ def plasmoid_dir(user):
     return Path(pwd.getpwnam(user).pw_dir) / '.local/share/plasma/plasmoids/com.keefeere.egpu'
 
 
+OUR_MARKERS = ('egpu-service-roles-profile@', '"Version": "1.')
+
+
+def is_ours(path):
+    """A widget file written by an earlier run of this installer (any version of it)."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    return OUR_MARKERS[0] in text or (path.name == 'metadata.json' and 'com.keefeere.egpu' in text
+                                      and '"Version": "1.' in text and path.with_name(path.name + PLASMOID_BACKUP_SUFFIX).exists())
+
+
+def install_generator():
+    """KWin GPU order follows the remembered profile at every login (see the script header)."""
+    write_new(GENERATOR, GENERATOR_SRC.read_text(), 0o755)
+
+
 def install_gui():
     """Profile switch in the Plasma widget: exact polkit-whitelisted units + widget update."""
     user = desktop_user()
@@ -139,18 +159,28 @@ def install_gui():
     qml, meta = target / 'contents/ui/main.qml', target / 'metadata.json'
     if not qml.is_file() or not meta.is_file():
         raise RuntimeError(f'eGPU widget is not installed at {target}')
-    for path in (PROFILE_UNIT, POLKIT, Path(str(qml) + PLASMOID_BACKUP_SUFFIX), Path(str(meta) + PLASMOID_BACKUP_SUFFIX)):
+    for path in (PROFILE_UNIT, POLKIT):
         if path.exists() or path.is_symlink():
             raise RuntimeError(f'GUI state already present: {path}')
+    for name in (qml, meta):
+        backup = Path(str(name) + PLASMOID_BACKUP_SUFFIX)
+        if backup.is_symlink() or (backup.exists() and not is_ours(name)):
+            raise RuntimeError(f'GUI state already present: {backup}')
     write_new(PROFILE_UNIT, PROFILE_UNIT_SRC.read_text(), 0o644)
     write_new(POLKIT, polkit_text(user), 0o644)
     info = pwd.getpwnam(user)
     for name, source in ((qml, PLASMOID_SRC / 'contents/ui/main.qml'), (meta, PLASMOID_SRC / 'metadata.json')):
-        shutil.copy2(name, str(name) + PLASMOID_BACKUP_SUFFIX)
+        backup = Path(str(name) + PLASMOID_BACKUP_SUFFIX)
+        if not backup.exists():  # first install: keep the user's original; later ones keep it
+            shutil.copy2(name, backup)
         shutil.copy2(source, name)
         os.chown(name, info.pw_uid, info.pw_gid)
-        os.chown(str(name) + PLASMOID_BACKUP_SUFFIX, info.pw_uid, info.pw_gid)
+        os.chown(backup, info.pw_uid, info.pw_gid)
     run(['systemctl', 'daemon-reload'])
+
+
+def remove_generator():
+    checked_remove(GENERATOR, GENERATOR_SRC.read_text())
 
 
 def remove_gui():
@@ -166,7 +196,7 @@ def remove_gui():
                              (target / 'metadata.json', PLASMOID_SRC / 'metadata.json')):
             backup = Path(str(name) + PLASMOID_BACKUP_SUFFIX)
             if backup.exists():
-                if name.read_text() == source.read_text():
+                if is_ours(name):
                     os.replace(backup, name)
                 else:
                     print(f'Widget file changed since install; kept as is: {name} (backup: {backup})', file=sys.stderr)
@@ -271,6 +301,7 @@ def install():
             if time.monotonic() > deadline:
                 raise RuntimeError(f'Reconciler did not enroll/admit KWin in time: {log[-400:]}')
             time.sleep(2)
+        install_generator()
         try:
             install_gui()
             gui = 'Plasma widget profile switch installed (re-add/refresh the widget or log in again).'

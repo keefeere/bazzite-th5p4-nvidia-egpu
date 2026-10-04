@@ -304,6 +304,24 @@ def reconcile(specs, admitted, runner=run, **kwargs):
     return actions
 
 
+def request_profile(name, runner=run, vendor_reader=None):
+    """What 'apply' means for users. The choice is ALWAYS remembered. A work profile also needs KWin to
+    render on the AMD GPU, which only changes at session start: if KWin is not there yet, the guard
+    stays as it is and the profile takes effect (the reconciler applies it) after the next login.
+    Returns 'applied' or 'pending-relogin'."""
+    if not NAME.fullmatch(name):
+        raise ValueError("invalid profile name")
+    info = status(runner)
+    if name not in info["profiles"]:
+        raise ValueError(f"unknown profile {name}; configured: {info['profiles']}")
+    remember_profile(name)
+    reader = vendor_reader or kwin_primary_vendor
+    if name.startswith("work-") and reader() != AMD_VENDOR:
+        return "pending-relogin"
+    apply_profile(name, runner, vendor_reader=reader)
+    return "applied"
+
+
 def note_error(message):
     """Reason of the last refused/failed apply, readable by the widget (best effort)."""
     try:
@@ -321,6 +339,7 @@ def remember_profile(name):
     try:
         DESIRED.parent.mkdir(parents=True, exist_ok=True)
         DESIRED.write_text(name + "\n")
+        os.chmod(DESIRED, 0o644)  # the widget and the login generator read it unprivileged
     except OSError:
         pass
 
@@ -365,12 +384,14 @@ def main(argv=None):
                 time.sleep(max(1.0, args.interval))
         elif args.command == "apply":
             try:
-                result = apply_profile(args.profile, force=args.force)
+                if args.force:
+                    result = apply_profile(args.profile, force=True)
+                else:
+                    result = {"profile": args.profile, "result": request_profile(args.profile)}
             except (RuntimeError, ValueError) as error:
                 note_error(str(error))
                 raise
             note_error(None)
-            remember_profile(args.profile)
         else:
             result = enroll(args.index, args.unit, args.exe)
     except (RuntimeError, ValueError, OSError) as error:

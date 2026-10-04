@@ -1,5 +1,6 @@
 """Offline guards for the persistent installer. No host service/GPU access."""
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -131,6 +132,53 @@ class Installer(unittest.TestCase):
                     inst.install_gui()
             self.assertEqual(qml.read_text(), 'old')
             self.assertFalse((home / 'unit').exists())
+
+    def test_generator_installs_executable_and_is_removed_only_if_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'gen/90-egpu-kwin-order'
+            with patch.object(inst, 'GENERATOR', target):
+                inst.install_generator()
+                self.assertEqual(oct(target.stat().st_mode & 0o777), '0o755')
+                self.assertEqual(target.read_text(), inst.GENERATOR_SRC.read_text())
+                target.write_text('edited')
+                with self.assertRaisesRegex(RuntimeError, 'changed'):
+                    inst.remove_generator()
+                target.write_text(inst.GENERATOR_SRC.read_text())
+                inst.remove_generator()
+                self.assertFalse(target.exists())
+
+    def test_widget_has_relogin_flow_and_no_privileged_commands(self):
+        qml = (inst.PLASMOID_SRC / 'contents/ui/main.qml').read_text()
+        self.assertIn('promptLogout', qml)          # KDE's own confirmation dialog, no silent logout
+        self.assertIn('desired-profile', qml)
+        self.assertNotIn('pkexec', qml)
+        self.assertNotIn('terminate-session', qml)
+
+    def test_reinstall_over_our_previous_widget_keeps_the_original_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            base = home / '.local/share/plasma/plasmoids/com.keefeere.egpu'
+            qml, meta = base / 'contents/ui/main.qml', base / 'metadata.json'
+            qml.parent.mkdir(parents=True)
+            qml.write_text('ORIGINAL qml')
+            meta.write_text('{"Id": "com.keefeere.egpu"}')
+            owner = type('P', (), {'pw_dir': str(home), 'pw_uid': os.getuid(), 'pw_gid': os.getgid()})()
+            with patch.object(inst, 'desktop_user', return_value='u'), patch.object(inst.pwd, 'getpwnam', return_value=owner), \
+                    patch.object(inst, 'PROFILE_UNIT', home / 'unit'), patch.object(inst, 'POLKIT', home / 'rule'), \
+                    patch.object(inst, 'run'), patch.object(inst.os, 'chown'):
+                inst.install_gui()
+                self.assertIn('egpu-service-roles-profile@', qml.read_text())
+                (home / 'unit').unlink()
+                (home / 'rule').unlink()
+                qml.write_text(qml.read_text() + '\n// older version of ours with the marker egpu-service-roles-profile@')
+                inst.install_gui()  # re-install over our own file: must not raise or re-backup
+                backup = Path(str(qml) + inst.PLASMOID_BACKUP_SUFFIX)
+                self.assertEqual(backup.read_text(), 'ORIGINAL qml')
+                (home / 'unit').unlink()
+                (home / 'rule').unlink()
+                with patch.object(inst, 'checked_remove'):
+                    inst.remove_gui()
+                self.assertEqual(qml.read_text(), 'ORIGINAL qml')
 
     def test_only_known_actions(self):
         self.assertEqual(set(inst.ACTIONS), {'--install', '--uninstall', '--status'})

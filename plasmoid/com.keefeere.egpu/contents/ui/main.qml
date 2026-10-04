@@ -36,16 +36,25 @@ PlasmoidItem {
     // The work profiles take NVIDIA away from every NEW program; that is only safe when the
     // compositor renders on the AMD GPU (otherwise new windows, even this widget, cannot be drawn).
     readonly property string kwinVendorCommand: "/usr/bin/sh -c 'd=$(/usr/bin/systemctl --user show-environment | /usr/bin/sed -n s/^KWIN_DRM_DEVICES=//p | /usr/bin/cut -d: -f1); /usr/bin/cat /sys/class/drm/$(/usr/bin/basename \"$d\")/device/vendor'"
+    readonly property string desiredCommand: "/usr/bin/cat /var/lib/egpu-nvidia-service-roles/desired-profile"
+    readonly property string logoutCommand: "/usr/bin/busctl --user call org.kde.LogoutPrompt /LogoutPrompt org.kde.LogoutPrompt promptLogout"
     readonly property string lastErrorCommand: "/usr/bin/cat /run/egpu-service-roles-last-error"
     property bool kwinOnAmd: false
+    property string desiredProfile: ""
+    // The choice the user made (remembered across restarts); falls back to what is active now.
+    readonly property string chosenProfile: desiredProfile.length > 0 ? desiredProfile : currentProfile
+    // KWin picks its render GPU at session start, so a work profile (AMD renders) and Gaming
+    // (NVIDIA renders) each need ONE session restart after a switch.
+    readonly property bool reloginPending: chosenProfile.length > 0 &&
+        ((chosenProfile !== "gaming-nvidia" && !kwinOnAmd) || (chosenProfile === "gaming-nvidia" && kwinOnAmd))
     property string currentProfile: ""
-    readonly property string currentProfileLabel: {
+    readonly property string chosenProfileLabel: {
         for (let i = 0; i < profiles.length; ++i) {
-            if (profiles[i].id === currentProfile) {
+            if (profiles[i].id === chosenProfile) {
                 return profiles[i].label;
             }
         }
-        return currentProfile;
+        return chosenProfile;
     }
     property string pendingProfile: ""
     property string profileError: ""
@@ -113,6 +122,12 @@ PlasmoidItem {
     function refreshKwin() {
         if (!kwinSource.connectedSources.includes(kwinVendorCommand)) {
             kwinSource.connectSource(kwinVendorCommand);
+        }
+    }
+
+    function refreshDesired() {
+        if (!desiredSource.connectedSources.includes(desiredCommand)) {
+            desiredSource.connectSource(desiredCommand);
         }
     }
 
@@ -195,6 +210,28 @@ PlasmoidItem {
     }
 
     Plasma5Support.DataSource {
+        id: desiredSource
+        engine: "executable"
+        connectedSources: []
+
+        onNewData: function(sourceName, data) {
+            disconnectSource(sourceName);
+            const value = (data["stdout"] ?? "").trim();
+            root.desiredProfile = /^[a-z0-9_-]{1,32}$/.test(value) ? value : "";
+        }
+    }
+
+    Plasma5Support.DataSource {
+        id: logoutSource
+        engine: "executable"
+        connectedSources: []
+
+        onNewData: function(sourceName, data) {
+            disconnectSource(sourceName);
+        }
+    }
+
+    Plasma5Support.DataSource {
         id: lastErrorSource
         engine: "executable"
         connectedSources: []
@@ -248,7 +285,7 @@ PlasmoidItem {
         repeat: true
         running: true
         triggeredOnStart: true
-        onTriggered: { root.refreshStatus(); root.refreshProfile(); root.refreshKwin(); }
+        onTriggered: { root.refreshStatus(); root.refreshProfile(); root.refreshKwin(); root.refreshDesired(); }
     }
 
     compactRepresentation: Item {
@@ -345,7 +382,7 @@ PlasmoidItem {
             PlasmaComponents3.Label {
                 Layout.fillWidth: true
                 visible: root.currentProfile.length > 0
-                text: root.localized("Active: ", "Активний: ") + root.currentProfileLabel
+                text: root.localized("Chosen: ", "Обрано: ") + root.chosenProfileLabel
                 color: Kirigami.Theme.positiveTextColor
                 wrapMode: Text.Wrap
             }
@@ -357,13 +394,11 @@ PlasmoidItem {
                     required property var modelData
                     Layout.fillWidth: true
                     icon.name: modelData.icon
-                    readonly property bool active: root.currentProfile === modelData.id
+                    readonly property bool active: root.chosenProfile === modelData.id
                     text: (active ? "✓ " : "") + modelData.label
                     font.bold: active
                     highlighted: active
-                    // Work profiles stay unavailable while KWin renders on NVIDIA.
-                    readonly property bool unsafe: modelData.id !== "gaming-nvidia" && !root.kwinOnAmd
-                    enabled: root.pendingProfile.length === 0 && !active && !unsafe
+                    enabled: root.pendingProfile.length === 0 && !active
                     PlasmaComponents3.ToolTip.text: modelData.hint
                     PlasmaComponents3.ToolTip.visible: hovered
                     onClicked: root.beginProfile(modelData.id)
@@ -372,17 +407,29 @@ PlasmoidItem {
 
             PlasmaComponents3.Label {
                 Layout.fillWidth: true
-                visible: root.currentProfile.length > 0 && !root.kwinOnAmd
-                text: root.localized(
-                    "Work profiles are unavailable: the desktop currently renders on NVIDIA, so new programs and this widget would stop drawing. They need KWin to render on the AMD GPU (a session restart).",
-                    "Робочі профілі недоступні: робочий стіл зараз рендериться на NVIDIA, тож нові програми та цей віджет перестали б малюватись. Для них KWin має рендеритись на AMD (потрібен перезапуск сеансу).")
+                visible: root.currentProfile.length > 0 && root.reloginPending
+                text: root.chosenProfile === "gaming-nvidia"
+                    ? root.localized(
+                        "Saved. Restart the session so the desktop renders on NVIDIA again.",
+                        "Збережено. Перезапусти сеанс, щоб робочий стіл знову рендерився на NVIDIA.")
+                    : root.localized(
+                        "Saved. Restart the session: the desktop will render on the AMD GPU, then the profile is applied automatically.",
+                        "Збережено. Перезапусти сеанс: робочий стіл рендеритиметься на AMD, після чого профіль застосується автоматично.")
                 color: Kirigami.Theme.neutralTextColor
                 wrapMode: Text.Wrap
             }
 
+            PlasmaComponents3.Button {
+                Layout.fillWidth: true
+                visible: root.currentProfile.length > 0 && root.reloginPending
+                icon.name: "system-log-out"
+                text: root.localized("Restart session…", "Перезапустити сеанс…")
+                onClicked: logoutSource.connectSource(root.logoutCommand)
+            }
+
             PlasmaComponents3.Label {
                 Layout.fillWidth: true
-                visible: root.currentProfile.length > 0 && root.currentProfile !== "gaming-nvidia"
+                visible: root.currentProfile.length > 0 && root.currentProfile !== "gaming-nvidia" && !root.reloginPending
                 text: root.localized(
                     "In a work profile, new programs cannot use NVIDIA; running apps, the compositor and llama are unaffected.",
                     "У робочому профілі нові програми не можуть використовувати NVIDIA; запущені програми, компoзитор і llama не зачіпаються.")

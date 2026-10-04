@@ -272,5 +272,39 @@ class SafetyAndPersistence(unittest.TestCase):
         self.assertIsNone(go(bus, "0x1002"))              # already current
 
 
+class RequestProfile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.desired = Path(self.tmp.name) / "d/desired"
+        self.patch = patch.object(ctl, "DESIRED", self.desired)
+        self.patch.start()
+        self.bus = FakeBus(current="gaming")
+        self.bus.profiles = ["gaming", "work-nvidia", "gaming-nvidia"]
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def test_work_profile_is_saved_but_not_applied_while_kwin_is_on_nvidia(self):
+        self.assertEqual(ctl.request_profile("work-nvidia", self.bus, lambda: "0x10de"), "pending-relogin")
+        self.assertEqual(self.desired.read_text(), "work-nvidia\n")
+        self.assertFalse(any("ApplyProfile" in c for c in self.bus.calls))
+
+    def test_work_profile_applies_immediately_once_kwin_is_on_amd(self):
+        self.assertEqual(ctl.request_profile("work-nvidia", self.bus, lambda: "0x1002"), "applied")
+        self.assertTrue(any("ApplyProfile" in c for c in self.bus.calls))
+
+    def test_gaming_always_applies_and_is_remembered(self):
+        self.assertEqual(ctl.request_profile("gaming-nvidia", self.bus, lambda: "0x1002"), "applied")
+        self.assertEqual(self.desired.read_text(), "gaming-nvidia\n")
+        self.assertEqual(oct(self.desired.stat().st_mode & 0o777), "0o644")
+
+    def test_unknown_or_malformed_names_leave_no_trace(self):
+        for bad in ("nope", "../x", ""):
+            with self.assertRaises(ValueError):
+                ctl.request_profile(bad, self.bus, lambda: "0x1002")
+        self.assertFalse(self.desired.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
