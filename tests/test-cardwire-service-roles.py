@@ -90,9 +90,21 @@ class Guards(unittest.TestCase):
                 run.assert_not_called()
                 self.assertTrue((root / 'restored').exists())
 
+    def test_archive_requires_recorded_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'trial'
+            root.mkdir(mode=0o700)
+            with patch.object(trial, 'ROOT', root), patch.object(trial.base, 'owned_trial_directory'), \
+                    patch('builtins.open', create=True), patch.object(trial.fcntl, 'flock'), \
+                    patch.object(trial.base, 'run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'rollback is not recorded'):
+                    trial.archive_restored()
+                run.assert_not_called()
+                self.assertTrue(root.exists())
+
     def test_only_known_actions(self):
         self.assertEqual(set(trial.ACTIONS), {'--start', '--start-with-deny-probe', '--execute',
-                                              '--execute-deny-probe', '--restore'})
+                                              '--execute-deny-probe', '--restore', '--archive-restored'})
 
 
 if __name__ == '__main__':

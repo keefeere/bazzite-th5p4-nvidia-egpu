@@ -31,8 +31,8 @@ PINS = Path('/sys/fs/bpf/cardwire-service-roles')
 PIN_NAMES = ('exec_link', 'open_link', 'CW_ACTIVE', 'CW_DEVICES_MAP', 'CW_ROLE_TASKS')
 HARDWARE = Path('/etc/egpu-nvidia/hardware.conf')
 CANDIDATE_DIR = Path('/var/home/keefeere/_repos/_home/cardwire-stable-process-access/'
-                     'dist/local-service-roles-a30e8d43e4a4404a')
-DAEMON_SHA = 'a30e8d43e4a4404a5ebb874e8be023dbe73bbb4028c1c7d4369960543b92c41a'
+                     'dist/local-service-roles-99013ecd90a08bb4')
+DAEMON_SHA = '99013ecd90a08bb4644c89469a740841bfc5640c995e660055b677ada53b66e8'
 OBJECT_SHA = 'e6b22a22cf515f510b830ce1aecab368dd71f23ece3d168ff0a0b996347f84d0'
 BUS = 'org.opengamingcollective.cardwire'
 OBJECT = '/org/opengamingcollective/cardwire'
@@ -221,7 +221,32 @@ def start(deny_probe=False):
     print('STARTED: bounded service-roles trial; systemd restores the baseline on exit.', flush=True)
 
 
+def archive_restored():
+    """Move a terminal, fully restored trial aside so a new --start may run.
+
+    Never starts/restarts Cardwire or changes GPU policy; it only verifies that
+    the baseline is intact and renames the root-owned trial directory.
+    """
+    import tempfile
+    with open('/run/egpu-nvidia-transition.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        base.owned_trial_directory(ROOT)
+        marker = ROOT / 'restored'
+        if marker.is_symlink() or not marker.is_file() or marker.stat().st_uid != 0:
+            raise RuntimeError('Successful rollback is not recorded')
+        for path in (DROPIN, CONFIG, PINS):
+            if path.exists() or path.is_symlink():
+                raise RuntimeError(f'State still exists: {path}')
+        base.quiescent_unit(UNIT + '.service')
+        base.baseline_matches(json.loads((ROOT / 'before.json').read_text()))
+        destination = Path(tempfile.mkdtemp(prefix=ROOT.name + '-archive-', dir=ROOT.parent)) / 'trial'
+        ROOT.rename(destination)
+        base.run(['systemctl', 'reset-failed', UNIT + '.service'])
+        print(f'ARCHIVED: {destination}; no GPU policy or running service changed.', flush=True)
+
+
 ACTIONS = {
+    '--archive-restored': archive_restored,
     '--start': lambda: start(False),
     '--start-with-deny-probe': lambda: start(True),
     '--execute': lambda: execute(False),
@@ -234,7 +259,7 @@ def main():
     if os.geteuid() != 0:
         raise RuntimeError('Requires administrator authentication')
     if len(sys.argv) != 2 or sys.argv[1] not in ACTIONS:
-        raise RuntimeError('Explicit --start or --start-with-deny-probe required')
+        raise RuntimeError('Explicit --start, --start-with-deny-probe or --archive-restored required')
     ACTIONS[sys.argv[1]]()
 
 
