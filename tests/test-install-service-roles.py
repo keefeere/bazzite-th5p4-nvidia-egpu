@@ -30,6 +30,9 @@ class Installer(unittest.TestCase):
         self.assertIn('0:user:llama.service:' + inst.LLAMA_EXE, text)
         self.assertIn('1:user:plasma-kwin_wayland.service:' + inst.KWIN_EXE, text)
         self.assertIn('Restart=always', text)
+        self.assertIn('Wants=cardwired.service', text)
+        self.assertNotIn('Requires=', text)  # Requires would stop it with cardwired for good
+        self.assertIn('Requires=cardwired.service', inst.unit_text('Requires'))
 
     def test_pinned_build_matches_the_wrapper(self):
         wrapper = Path(__file__).resolve().parents[1] / 'diagnostics/test-cardwire-service-roles.py'
@@ -58,6 +61,16 @@ class Installer(unittest.TestCase):
             path.write_text('original')
             inst.checked_remove(path, 'original')
             self.assertFalse(path.exists())
+
+    def test_uninstall_accepts_the_first_release_unit_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'u.service'
+            path.write_text(inst.unit_text('Requires'))
+            inst.checked_remove(path, (inst.unit_text(), inst.unit_text('Requires')))
+            self.assertFalse(path.exists())
+            path.write_text(inst.unit_text() + 'edited')
+            with self.assertRaisesRegex(RuntimeError, 'changed'):
+                inst.checked_remove(path, (inst.unit_text(), inst.unit_text('Requires')))
 
     def test_pin_removal_refuses_unknown_entries(self):
         with tempfile.TemporaryDirectory() as tmp:

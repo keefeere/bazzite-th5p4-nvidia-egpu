@@ -86,10 +86,13 @@ def role_args():
             f'1:user:plasma-kwin_wayland.service:{KWIN_EXE}:{USER_UID}']
 
 
-def unit_text():
+def unit_text(dependency='Wants'):
+    # Wants, not Requires: Requires stops this unit whenever cardwired is stopped (seen on
+    # the host: the egpu flow stops/starts cardwired) and nothing starts it again. The loop
+    # already tolerates a missing or restarting daemon.
     roles = ' '.join(f'--role-unit {r}' for r in role_args())
     return ('[Unit]\nDescription=Keep Cardwire service roles bound to their current services\n'
-            'After=cardwired.service\nRequires=cardwired.service\n\n'
+            f'After=cardwired.service\n{dependency}=cardwired.service\n\n'
             '[Service]\nType=simple\n'
             f'ExecStart=/usr/bin/python3 {SHARE}/egpu-service-roles-ctl.py reconcile --loop '
             f'--interval 5 {roles}\nRestart=always\nRestartSec=3\n\n'
@@ -135,14 +138,15 @@ def checked_remove(path, expected_text):
     if path.is_symlink():
         raise RuntimeError(f'Refusing symlink: {path}')
     if path.exists():
-        if path.read_text() != expected_text:
+        accepted = expected_text if isinstance(expected_text, tuple) else (expected_text,)
+        if path.read_text() not in accepted:
             raise RuntimeError(f'Refusing changed file: {path}')
         path.unlink()
 
 
 def uninstall(expected_config=None):
     run(['systemctl', 'disable', '--now', RECONCILE], check=False)
-    checked_remove(UNIT_FILE, unit_text())
+    checked_remove(UNIT_FILE, (unit_text(), unit_text('Requires')))  # Requires: first release
     run(['systemctl', 'stop', 'cardwired.service'], timeout=90)
     run(['systemctl', 'clean', '--what=fdstore', 'cardwired.service'], check=False)
     remove_pins()

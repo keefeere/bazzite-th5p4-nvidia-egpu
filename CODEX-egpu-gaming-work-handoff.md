@@ -174,6 +174,89 @@ llama — USER-сервіс, а ReEnrollRole root-only: user-unit не може 
   (bin_t -> unconfined_service_t, далі exec llama з uid 1000). Додано reset-failed transient. Тести 11 OK.
 - Наступне: `--archive-restored`, потім `--start-llama-role` знову.
 
+### Оновлення 2026-10-04 13:55: llama-trial #2 — РЕАЛЬНА ПОМИЛКА знайдена і виправлена (btrfs)
+
+- Trial 13:46 (з setpriv): llama стартував, але `ggml_cuda_init: no CUDA-capable device` під work-nvidia =
+  роль НЕ допущена. Причина: /home — btrfs subvolume (`subvol=/home`); `st_dev` файлів = анонімний
+  device підтому (0:58), а BPF порівнює `sb->s_dev` (0:36 з mountinfo). Роль на btrfs не могла збігтись.
+  (VM цього не показала: там не btrfs-підтом.)
+- Фікс (форк): `superblock_dev()` = statx(STATX_MNT_ID) + /proc/self/mountinfo при РЕЄСТРАЦІЇ; manifest v3
+  (CWPST003) зберігає `exe_stat_dev[]`; `Registration::from_held` при adoption перевіряє inode і st_dev
+  дескриптора й довіряє збереженому s_dev (mount id старого mount namespace у новому недоступний).
+  Тести: 42 userspace, 102 daemon; VM probe 2/2 + persistent + suite PASS.
+- Нова збірка dist/local-service-roles-<sha[:16]> (SHA оновлено в обгортці).
+
+### Оновлення 2026-10-04 13:56: llama-trial #3 PASSED на реальному залізі
+
+- `LLAMA ROLE OK: llama holds [/dev/nvidia-uvm, /dev/nvidia0, /dev/nvidiactl] under work-nvidia; plain process
+  refused (errno 13)`; `RESTORED`. llama запущено як SYSTEM unit через `setpriv` з `ExecStartPre=+ enroll`,
+  роль compute допущена на btrfs (фікс superblock dev), звичайний процес відхилено. Після trial: user llama
+  відновлено, cardwired secure/Hybrid, FD store 0.
+- Підтверджено реально: re-enrollment до exec, SELinux (FD store приймає exe gconf_home_t; init_t не може
+  exec home-бінарник -> setpriv), btrfs-ідентичність, Gaming/Work-NVIDIA, default_mask, initial_profile.
+- Лишається: KWin display-роль (потребує перезапуску сесії = окрема згода), work-igpu, довге використання
+  (не 330 с), постійне встановлення (cardwired з feature + drop-in + конфіг + llama як system unit),
+  push. Все закомічено локально.
+
+### Оновлення 2026-10-04 15:00: AdmitProcess, reconcile, KWin-trial без логауту; ІНСТАЛЯТОР заблоковано
+
+- Форк: `PersistentGuard::admit_process` (pidfd -> ticket у pinned task-storage; перевіряє exe inode+st_dev,
+  real==effective uid, cgroup id), root-only D-Bus `AdmitProcess(uu)`, властивість `Roles` (a(tttu)).
+  VM: INTEGRATED_DAEMON_VM_PASSED 2/2 (+ non-root/чужий процес/невідома роль відхилено; ticket переживає SIGKILL).
+- Helper: `egpu-service-roles-ctl.py reconcile --role-unit INDEX:SCOPE:UNIT:EXE:UID [--loop]` (enroll за новою
+  cgroup + AdmitProcess; cgroup сервісу шукається в дереві cgroup, без runuser/PAM). Тести 12 OK.
+- `--start-kwin-role` у обгортці trial: admit запущеного kwin_wayland (pidfd) без перезапуску сесії -> work-nvidia
+  -> compositor відповідає на шині, звичайний процес відхилено -> 20 с soak -> gaming. НЕ запущено.
+  Нюанс: реальне ВІДКРИТТЯ NVIDIA самим KWin під роллю перевіряється лише при його рестарті; KWin відкриває вузли
+  тільки на старті, тож Work-профіль треба застосовувати ПІСЛЯ логіну (reconcile встигає admit-ити).
+- ПОСТІЙНЕ ВСТАНОВЛЕННЯ: створення скрипта-інсталятора (drop-in 96, service-roles.toml, reconcile service,
+  uninstall) автоматичний класифікатор дозволів ЗАБЛОКУВАВ як "Unauthorized Persistence". Не обходилось.
+  Дизайн збережено в цьому записі: release у /var/opt/cardwire-fork/releases/service-roles-<sha16>/,
+  drop-in 96 (BindReadOnlyPaths скидання + новий бінарник, NotifyAccess=main, FDStoreMax=64, Preserve=yes,
+  ReadWritePaths=/sys/fs/bpf), config з placeholder-cgroup system.slice/user.slice і initial_profile=gaming-nvidia,
+  system unit `egpu-service-roles-reconcile.service` (After/Requires=cardwired, `ctl reconcile --loop`),
+  автовідкат при збої post-check. Потрібне рішення користувача (правило дозволу або власноручне створення).
+
+### Оновлення 2026-10-04 14:15: KWin-trial #1 — admit не пройшов (CAP_KILL), виправлено
+
+- Trial 14:12: `plasma-kwin_wayland.service: pid 187661 not admitted: process vanished during verification`.
+  Причина: liveness-перевірка через `pidfd_send_signal(0)`, а демон за hardening не має CAP_KILL (не може
+  сигналити процесу іншого uid; у VM ціль була root). Фікс: `poll(pidfd, POLLIN, 0)`. VM 2/2 PASS.
+- Нова збірка dist/local-service-roles-<sha16>, SHA зашито в обгортці. Повторити `--archive-restored`, потім `--start-kwin-role`.
+
+### Оновлення 2026-10-04 14:17: KWin-trial #2 PASSED на реальному залізі
+
+- `KWIN ADMITTED: ... admitted pid 187661`, `KWIN ROLE OK under work-nvidia: plain process refused (errno 13);
+  compositor answers`, 20 с soak, `RESTORED`. Compositor (kwin_wayland, cap_sys_nice) допущено за pidfd БЕЗ
+  перезапуску сесії; KWin/llama/cardwired у вихідному стані, 0 AVC.
+- Підтверджено на залізі: Gaming, Work-NVIDIA, роль llama (enroll до exec), роль KWin (AdmitProcess),
+  default_mask, initial_profile, btrfs-ідентичність, SELinux (FD store приймає exe; init_t не exec-ить home-бінарник).
+- Лишається: постійне встановлення (інсталятор заблоковано класифікатором "Unauthorized Persistence" —
+  потрібне рішення користувача; дизайн збережено вище), work-igpu на залізі, реальне ВІДКРИТТЯ вузлів KWin під
+  роллю при його рестарті, довге використання, push.
+
+### Оновлення 2026-10-04 14:30: інсталятор СТВОРЕНО (за прямим проханням користувача), НЕ запущено
+
+- `install-service-roles.py` (+ `tests/test-install-service-roles.py`, 9 OK, нічого не запускає на системі):
+  `--install` / `--uninstall` / `--status`. Закріплена збірка SHA 9cc15a1d… (checksum кандидата перевірено).
+  Install: release у /var/opt/cardwire-fork/releases/service-roles-<sha16>/, config з initial_profile=gaming-nvidia
+  (placeholder-cgroup system.slice/user.slice), drop-in 96, `egpu-service-roles-reconcile.service`
+  (llama compute + KWin display), перевірки Hybrid/профіль/admit KWin, АВТОВІДКАТ при збої.
+  Uninstall: зворотний, повертає secure 6213983.
+- Користувач запускає сам: `sudo python3 .../install-service-roles.py --install`.
+
+### Оновлення 2026-10-04 14:25: ПОСТІЙНЕ ВСТАНОВЛЕННЯ ВИКОНАНО користувачем і працює
+
+- Користувач запустив `install-service-roles.py --install` (14:20:23): `INSTALLED`, reconcile: `llama.service: enrolled
+  role 0 (generation 3) / admitted pid 1872221`, `plasma-kwin_wayland.service: enrolled role 1 (generation 4) /
+  admitted pid 187661`. (Перед цим один раз `--uninstall` -> чистий відкат, потім знову `--install`: обидва напрямки
+  перевірено на хості.)
+- Живий стан: cardwired (service-roles build 9cc15a1d…), Hybrid `u 1`, CurrentProfile=gaming-nvidia, Generation 4,
+  DefaultMask 127, Roles = 2 (llama, kwin) прив'язані до ПОТОЧНИХ cgroup, reconcile active, KWin 187650 / llama 1872221
+  не перезапускались, 0 AVC, nvidia-smi OK.
+- Лишається: work-igpu на залізі, реальне відкриття вузлів KWin під роллю при його рестарті (логаут), довге
+  використання, push (користувач запушить сам).
+
 ### Мета і межі
 
 Три профілі в НАЯВНОМУ eGPU-helper + Cardwire:
