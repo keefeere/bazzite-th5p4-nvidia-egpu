@@ -195,7 +195,7 @@ class Installer(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text)
             patches = [patch.object(inst, name, path) for name, (path, _) in files.items()]
-            patches += [patch.object(inst, 'SHARE', root / 'share'), patch.object(inst, 'PINS', root / 'pins'),
+            patches += [patch.object(inst.shutil, 'rmtree'), patch.object(inst, 'PINS', root / 'pins'),
                         patch.object(inst, 'run'), patch.object(inst, 'daemon_digest', return_value=inst.OLD_SHA),
                         patch.object(inst, 'mode', return_value='u 1'),
                         patch.object(inst, 'desktop_user', side_effect=RuntimeError('no hardware.conf'))]
