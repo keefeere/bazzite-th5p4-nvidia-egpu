@@ -34,6 +34,14 @@ PlasmoidItem {
           hint: localized("AMD renders and displays; NVIDIA only runs allowed compute.", "AMD рендерить і виводить зображення; NVIDIA лише для дозволених обчислень.") }
     ]
     property string currentProfile: ""
+    readonly property string currentProfileLabel: {
+        for (let i = 0; i < profiles.length; ++i) {
+            if (profiles[i].id === currentProfile) {
+                return profiles[i].label;
+            }
+        }
+        return currentProfile;
+    }
     property string pendingProfile: ""
     property string profileError: ""
 
@@ -298,6 +306,14 @@ PlasmoidItem {
                 font.bold: true
             }
 
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                visible: root.currentProfile.length > 0
+                text: root.localized("Active: ", "Активний: ") + root.currentProfileLabel
+                color: Kirigami.Theme.positiveTextColor
+                wrapMode: Text.Wrap
+            }
+
             Repeater {
                 model: root.currentProfile.length > 0 ? root.profiles : []
 
@@ -305,10 +321,11 @@ PlasmoidItem {
                     required property var modelData
                     Layout.fillWidth: true
                     icon.name: modelData.icon
-                    text: modelData.label
-                    checkable: true
-                    checked: root.currentProfile === modelData.id
-                    enabled: root.pendingProfile.length === 0 && !checked
+                    readonly property bool active: root.currentProfile === modelData.id
+                    text: (active ? "✓ " : "") + modelData.label
+                    font.bold: active
+                    highlighted: active
+                    enabled: root.pendingProfile.length === 0 && !active
                     PlasmaComponents3.ToolTip.text: modelData.hint
                     PlasmaComponents3.ToolTip.visible: hovered
                     onClicked: root.beginProfile(modelData.id)
