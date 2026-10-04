@@ -32,8 +32,8 @@ PINS = Path('/sys/fs/bpf/cardwire-service-roles')
 PIN_NAMES = ('exec_link', 'open_link', 'CW_ACTIVE', 'CW_DEVICES_MAP', 'CW_ROLE_TASKS')
 HARDWARE = Path('/etc/egpu-nvidia/hardware.conf')
 CANDIDATE_DIR = Path('/var/home/keefeere/_repos/_home/cardwire-stable-process-access/'
-                     'dist/local-service-roles-2152fd1621f7c39c')
-DAEMON_SHA = '2152fd1621f7c39c905c2bb9325de421c12f7566377720708181eb9e525116eb'
+                     'dist/local-service-roles-9cc15a1d06a9db1e')
+DAEMON_SHA = '9cc15a1d06a9db1e29fd6898e1e81821122853573d29da2b60c74021df0478b2'
 OBJECT_SHA = 'e6b22a22cf515f510b830ce1aecab368dd71f23ece3d168ff0a0b996347f84d0'
 BUS = 'org.opengamingcollective.cardwire'
 OBJECT = '/org/opengamingcollective/cardwire'
