@@ -30,6 +30,12 @@ class ServiceRolesConfig(unittest.TestCase):
         self.assertIn("permissions = [15, 15]\ndefault_mask = 15", text)
         self.assertIn("permissions = [12, 0]\ndefault_mask = 0", text)
 
+    def test_initial_profile_is_top_level_and_validated(self):
+        text = gen.render(NODES, ROLES, "/o.bpf.o", initial_profile="gaming-nvidia")
+        self.assertLess(text.index("initial_profile"), text.index("[[role]]"))
+        with self.assertRaises(ValueError):
+            gen.render(NODES, ROLES, "/o.bpf.o", initial_profile="nope")
+
     def test_masks_fit_device_count_and_toml_shape(self):
         text = gen.render(NODES, ROLES, "/o.bpf.o")
         self.assertEqual(text.count("[[role]]"), 2)

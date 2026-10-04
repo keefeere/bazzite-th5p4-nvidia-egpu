@@ -104,14 +104,18 @@ def default_mask(profile, nodes):
     return (1 << len(nodes)) - 1 if profile == "gaming-nvidia" else 0
 
 
-def render(nodes, roles, bpf_object, unit="cardwired.service"):
+def render(nodes, roles, bpf_object, unit="cardwired.service", initial_profile=None):
     if not 1 <= len(roles) <= MAX_ROLES:
         raise ValueError("1..16 roles required")
     for text in [bpf_object, unit] + [p for p, _ in nodes] + [r[i] for r in roles for i in (1, 2)]:
         if any(c in text for c in '"\\\n\r'):
             raise ValueError(f"unsafe character in {text!r}")
-    out = ["enabled = true", f'bpf_object = "{bpf_object}"', f'unit = "{unit}"',
-           "devices = ["]
+    if initial_profile is not None and initial_profile not in PROFILES:
+        raise ValueError("unknown initial profile")
+    out = ["enabled = true"]
+    if initial_profile:
+        out.append(f'initial_profile = "{initial_profile}"')
+    out += [f'bpf_object = "{bpf_object}"', f'unit = "{unit}"', "devices = ["]
     out += [f'  "{p}",' for p, _ in nodes] + ["]", ""]
     for kind, exe, cgroup, uid in roles:
         out += [f"# {kind} role", "[[role]]", f'executable = "{exe}"',

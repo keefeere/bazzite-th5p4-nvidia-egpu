@@ -31,8 +31,8 @@ PINS = Path('/sys/fs/bpf/cardwire-service-roles')
 PIN_NAMES = ('exec_link', 'open_link', 'CW_ACTIVE', 'CW_DEVICES_MAP', 'CW_ROLE_TASKS')
 HARDWARE = Path('/etc/egpu-nvidia/hardware.conf')
 CANDIDATE_DIR = Path('/var/home/keefeere/_repos/_home/cardwire-stable-process-access/'
-                     'dist/local-service-roles-99013ecd90a08bb4')
-DAEMON_SHA = '99013ecd90a08bb4644c89469a740841bfc5640c995e660055b677ada53b66e8'
+                     'dist/local-service-roles-72f973bd8b06de59')
+DAEMON_SHA = '72f973bd8b06de5934e49ce6583efa44f589af200bc2e264ea7200bd7d23b408'
 OBJECT_SHA = 'e6b22a22cf515f510b830ce1aecab368dd71f23ece3d168ff0a0b996347f84d0'
 BUS = 'org.opengamingcollective.cardwire'
 OBJECT = '/org/opengamingcollective/cardwire'
@@ -67,7 +67,8 @@ def override_text():
 
 def config_text(inventory_nodes):
     roles = [generator.parse_role('compute:/usr/bin/true:/sys/fs/cgroup/system.slice:0')]
-    return generator.render(inventory_nodes, roles, str(ROOT / 'service_guard.bpf.o'))
+    return generator.render(inventory_nodes, roles, str(ROOT / 'service_guard.bpf.o'),
+                            initial_profile='gaming-nvidia')
 
 
 def busctl(*args):
