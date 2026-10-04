@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
 import os
+from unittest.mock import patch
 from pathlib import Path
 import subprocess
 import tempfile
@@ -32,7 +33,7 @@ class FakeBus:
             name = args[-1]
             return done({"Generation": "t 3", "CurrentProfile": f's "{self.current}"',
                          "Permissions": "au 2 1 3", "DefaultMask": "u 0",
-                         "Profiles": 'as 2 "gaming" "work"'}[name])
+                         "Profiles": f'as {len(self.profiles)} ' + " ".join(f'"{p}"' for p in self.profiles)}[name])
         if verb == "call" and args[-3] == "ApplyProfile":
             target = args[-1]
             if self.broken == "fail" and target == "work":
@@ -172,6 +173,103 @@ class Reconcile(unittest.TestCase):
         bad = ctl.parse_role_unit("3:user:k.service:/bin/sh:1000")
         with self.assertRaises(RuntimeError):
             self.go(set(), 1, bad)
+
+
+
+class SafetyAndPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def kwin_tree(self, devices, vendor):
+        cg = self.root / "cg/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-kwin_wayland.service"
+        cg.mkdir(parents=True)
+        (cg / "cgroup.procs").write_text("5\n7\n")
+        proc = self.root / "proc"
+        for pid, env in (("5", b"HOME=/h\0"), ("7", b"A=1\0KWIN_DRM_DEVICES=" + devices + b"\0")):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "environ").write_bytes(env)
+        card = self.root / "sys/class/drm/card0/device"
+        card.mkdir(parents=True)
+        (card / "vendor").write_text(vendor + "\n")
+        return self.root / "cg", proc, self.root / "sys"
+
+    def test_kwin_primary_vendor_is_read_from_the_first_device(self):
+        cg, proc, sysfs = self.kwin_tree(b"/dev/dri/card0:/dev/dri/card1", "0x10de")
+        self.assertEqual(ctl.kwin_primary_vendor(cg, proc, sysfs), "0x10de")
+        self.assertIsNone(ctl.kwin_primary_vendor(self.root / "empty", proc, sysfs))
+
+    def test_malicious_or_odd_device_values_are_not_trusted(self):
+        cg, proc, sysfs = self.kwin_tree(b"../../etc/passwd:/dev/dri/card1", "0x1002")
+        self.assertIsNone(ctl.kwin_primary_vendor(cg, proc, sysfs))
+
+    def test_work_profiles_refused_while_kwin_renders_on_nvidia(self):
+        with self.assertRaisesRegex(RuntimeError, "AMD"):
+            ctl.preflight("work-nvidia", lambda: "0x10de")
+        with self.assertRaisesRegex(RuntimeError, "AMD"):
+            ctl.preflight("work-igpu", lambda: None)
+        ctl.preflight("work-nvidia", lambda: "0x1002")      # AMD primary: allowed
+        ctl.preflight("gaming-nvidia", lambda: "0x10de")    # gaming is always safe
+
+    def test_apply_refuses_before_touching_the_daemon(self):
+        bus = FakeBus()
+        with patch.object(ctl, "kwin_primary_vendor", return_value="0x10de"):
+            with self.assertRaisesRegex(RuntimeError, "AMD"):
+                ctl.apply_profile("work-nvidia", bus)
+        self.assertEqual(bus.calls, [])
+
+    def test_note_and_remember_are_best_effort(self):
+        with patch.object(ctl, "LAST_ERROR", self.root / "err"), patch.object(ctl, "DESIRED", self.root / "d/desired"):
+            ctl.note_error("boom")
+            self.assertEqual((self.root / "err").read_text(), "boom\n")
+            ctl.note_error(None)
+            self.assertFalse((self.root / "err").exists())
+            ctl.remember_profile("work-nvidia")
+            self.assertEqual((self.root / "d/desired").read_text(), "work-nvidia\n")
+        with patch.object(ctl, "LAST_ERROR", Path("/proc/nope/err")):
+            ctl.note_error("x")  # must not raise
+
+    def test_remembered_profile_restored_only_when_bound_and_safe(self):
+        desired = self.root / "desired"
+        desired.write_text("work-nvidia\n")
+        cg = self.root / "cg/user.slice/user-1000.slice/user@1000.service/app.slice/llama.service"
+        cg.mkdir(parents=True)
+        spec = ctl.parse_role_unit("0:user:llama.service:/bin/sh:1000")
+        ino = cg.stat().st_ino
+        state = {}
+        applied = []
+
+        class Bus(FakeBus):
+            def __init__(self, bound):
+                super().__init__(current="gaming")
+                self.bound = bound
+            def __call__(self, args):
+                if args[2] == "get-property" and args[-1] == "Roles":
+                    return done(f"a(tttu) 1 1 {ino if self.bound else 5} 9 1000")
+                if args[2] == "call" and args[-3] == "ApplyProfile":
+                    applied.append(args[-1])
+                    self.current = args[-1]
+                    return done("t 5")
+                return super().__call__(args)
+
+        def go(bus, vendor):
+            with patch.object(ctl, "kwin_primary_vendor", return_value=vendor):
+                return ctl.restore_desired([spec], state, bus, desired, self.root / "cg", vendor_reader=lambda: vendor)
+
+        bus = Bus(bound=False)
+        bus.profiles = ["gaming", "work-nvidia"]
+        self.assertIsNone(go(bus, "0x1002"))            # roles not bound yet: wait
+        self.assertEqual(applied, [])
+        bus.bound = True
+        self.assertIn("not restored", go(bus, "0x10de"))  # KWin on NVIDIA: refuse, say so
+        self.assertIsNone(go(bus, "0x10de"))              # ...only once
+        self.assertEqual(applied, [])
+        self.assertIn("restored remembered profile", go(bus, "0x1002"))
+        self.assertEqual(applied, ["work-nvidia"])
+        self.assertIsNone(go(bus, "0x1002"))              # already current
 
 
 if __name__ == "__main__":

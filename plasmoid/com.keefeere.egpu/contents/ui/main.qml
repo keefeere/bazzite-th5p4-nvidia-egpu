@@ -33,6 +33,11 @@ PlasmoidItem {
         { id: "work-igpu", icon: "cpu", label: localized("Work: iGPU displays", "Робота: дисплеї iGPU"),
           hint: localized("AMD renders and displays; NVIDIA only runs allowed compute.", "AMD рендерить і виводить зображення; NVIDIA лише для дозволених обчислень.") }
     ]
+    // The work profiles take NVIDIA away from every NEW program; that is only safe when the
+    // compositor renders on the AMD GPU (otherwise new windows, even this widget, cannot be drawn).
+    readonly property string kwinVendorCommand: "/usr/bin/sh -c 'd=$(/usr/bin/systemctl --user show-environment | /usr/bin/sed -n s/^KWIN_DRM_DEVICES=//p | /usr/bin/cut -d: -f1); /usr/bin/cat /sys/class/drm/$(/usr/bin/basename \"$d\")/device/vendor'"
+    readonly property string lastErrorCommand: "/usr/bin/cat /run/egpu-service-roles-last-error"
+    property bool kwinOnAmd: false
     property string currentProfile: ""
     readonly property string currentProfileLabel: {
         for (let i = 0; i < profiles.length; ++i) {
@@ -105,6 +110,12 @@ PlasmoidItem {
         }
     }
 
+    function refreshKwin() {
+        if (!kwinSource.connectedSources.includes(kwinVendorCommand)) {
+            kwinSource.connectSource(kwinVendorCommand);
+        }
+    }
+
     function applyProfile(output) {
         const match = output.trim().match(/^s "([a-z0-9_-]*)"$/);
         currentProfile = match ? match[1] : "";
@@ -173,6 +184,31 @@ PlasmoidItem {
     }
 
     Plasma5Support.DataSource {
+        id: kwinSource
+        engine: "executable"
+        connectedSources: []
+
+        onNewData: function(sourceName, data) {
+            disconnectSource(sourceName);
+            root.kwinOnAmd = (data["stdout"] ?? "").trim() === "0x1002";
+        }
+    }
+
+    Plasma5Support.DataSource {
+        id: lastErrorSource
+        engine: "executable"
+        connectedSources: []
+
+        onNewData: function(sourceName, data) {
+            disconnectSource(sourceName);
+            const reason = (data["stdout"] ?? "").trim();
+            if (reason.length > 0) {
+                root.profileError = reason;
+            }
+        }
+    }
+
+    Plasma5Support.DataSource {
         id: profileApplySource
         engine: "executable"
         connectedSources: []
@@ -181,9 +217,9 @@ PlasmoidItem {
             disconnectSource(sourceName);
             const exitCode = data["exit code"] ?? data["exitCode"] ?? 0;
             if (exitCode !== 0) {
-                const stderr = (data["stderr"] ?? "").trim();
-                root.profileError = stderr.length > 0 ? stderr :
-                    root.localized("The profile was not applied (exit code ", "Профіль не застосовано (код ") + exitCode + ")";
+                // The control tool leaves the reason in a world-readable file.
+                root.profileError = root.localized("The profile was not applied.", "Профіль не застосовано.");
+                lastErrorSource.connectSource(root.lastErrorCommand);
             }
             root.pendingProfile = "";
             root.refreshProfile();
@@ -212,7 +248,7 @@ PlasmoidItem {
         repeat: true
         running: true
         triggeredOnStart: true
-        onTriggered: { root.refreshStatus(); root.refreshProfile(); }
+        onTriggered: { root.refreshStatus(); root.refreshProfile(); root.refreshKwin(); }
     }
 
     compactRepresentation: Item {
@@ -325,11 +361,23 @@ PlasmoidItem {
                     text: (active ? "✓ " : "") + modelData.label
                     font.bold: active
                     highlighted: active
-                    enabled: root.pendingProfile.length === 0 && !active
+                    // Work profiles stay unavailable while KWin renders on NVIDIA.
+                    readonly property bool unsafe: modelData.id !== "gaming-nvidia" && !root.kwinOnAmd
+                    enabled: root.pendingProfile.length === 0 && !active && !unsafe
                     PlasmaComponents3.ToolTip.text: modelData.hint
                     PlasmaComponents3.ToolTip.visible: hovered
                     onClicked: root.beginProfile(modelData.id)
                 }
+            }
+
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                visible: root.currentProfile.length > 0 && !root.kwinOnAmd
+                text: root.localized(
+                    "Work profiles are unavailable: the desktop currently renders on NVIDIA, so new programs and this widget would stop drawing. They need KWin to render on the AMD GPU (a session restart).",
+                    "Робочі профілі недоступні: робочий стіл зараз рендериться на NVIDIA, тож нові програми та цей віджет перестали б малюватись. Для них KWin має рендеритись на AMD (потрібен перезапуск сеансу).")
+                color: Kirigami.Theme.neutralTextColor
+                wrapMode: Text.Wrap
             }
 
             PlasmaComponents3.Label {

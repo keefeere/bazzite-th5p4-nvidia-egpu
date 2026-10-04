@@ -74,9 +74,53 @@ def status(runner=run):
     }
 
 
-def apply_profile(name, runner=run):
+AMD_VENDOR = "0x1002"
+LAST_ERROR = Path("/run/egpu-service-roles-last-error")
+DESIRED = Path("/var/lib/egpu-nvidia-service-roles/desired-profile")
+KWIN_SPEC = {"scope": "user", "unit": "plasma-kwin_wayland.service", "uid": 1000}
+
+
+def kwin_primary_vendor(cgroup_root=Path("/sys/fs/cgroup"), proc=Path("/proc"), sysfs=Path("/sys")):
+    """PCI vendor of the GPU the running KWin treats as primary (first KWIN_DRM_DEVICES entry).
+    Returns None when KWin or the variable cannot be found."""
+    directory = unit_cgroup_dir(KWIN_SPEC, cgroup_root)
+    if directory is None:
+        return None
+    for pid in (directory / "cgroup.procs").read_text().split():
+        try:
+            environ = (proc / pid / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        for item in environ:
+            if item.startswith(b"KWIN_DRM_DEVICES="):
+                first = item.split(b"=", 1)[1].decode().split(":")[0]
+                card = Path(first).name
+                if not re.fullmatch(r"card\d+", card):
+                    return None
+                try:
+                    return (sysfs / "class/drm" / card / "device/vendor").read_text().strip()
+                except OSError:
+                    return None
+    return None
+
+
+def preflight(name, vendor_reader=kwin_primary_vendor):
+    """A work profile removes NVIDIA from every NEW process. That is only safe when the compositor
+    renders on the AMD GPU; otherwise new windows (even this widget) cannot be drawn."""
+    if name.startswith("work-"):
+        vendor = vendor_reader()
+        if vendor != AMD_VENDOR:
+            raise RuntimeError(
+                "Work profiles need KWin to render on the AMD GPU, but it renders on NVIDIA now "
+                "(new programs and this widget would stop drawing). Refusing; switch KWin to "
+                "AMD-first first (needs a session restart).")
+
+
+def apply_profile(name, runner=run, force=False, vendor_reader=None):
     if not NAME.fullmatch(name):
         raise ValueError("invalid profile name")
+    if not force:
+        preflight(name, vendor_reader or kwin_primary_vendor)
     before = status(runner)
     if name not in before["profiles"]:
         raise ValueError(f"unknown profile {name}; configured: {before['profiles']}")
@@ -214,6 +258,43 @@ def enroll_paths(index, exe, cgroup, runner=run):
     return parse_value(out)
 
 
+def all_bound(specs, roles, cgroup_root=Path("/sys/fs/cgroup")):
+    """Every configured role is bound to its service's CURRENT cgroup."""
+    for spec in specs:
+        directory = unit_cgroup_dir(spec, cgroup_root)
+        if directory is None or spec["index"] >= len(roles) or roles[spec["index"]][1] != directory.stat().st_ino:
+            return False
+    return True
+
+
+def restore_desired(specs, state, runner=run, desired_path=None, cgroup_root=Path("/sys/fs/cgroup"),
+                    vendor_reader=kwin_primary_vendor):
+    """Re-apply the remembered profile after a daemon/boot reset, but only once every role is bound
+    and (for work profiles) the compositor renders on AMD. Returns a message or None."""
+    path = desired_path or DESIRED
+    try:
+        desired = path.read_text().strip()
+    except OSError:
+        return None
+    if not NAME.fullmatch(desired):
+        return None
+    info = status(runner)
+    if info["current_profile"] == desired or desired not in info["profiles"]:
+        return None
+    if not all_bound(specs, parse_roles(get_property(runner, "Roles")), cgroup_root):
+        return None
+    try:
+        apply_profile(desired, runner, vendor_reader=vendor_reader)
+    except RuntimeError as error:
+        text = f"remembered profile {desired} not restored: {error}"
+        if state.get("last_refusal") == text:
+            return None  # say it once, not every pass
+        state["last_refusal"] = text
+        return text
+    state.pop("last_refusal", None)
+    return f"restored remembered profile {desired}"
+
+
 def reconcile(specs, admitted, runner=run, **kwargs):
     roles = parse_roles(get_property(runner, "Roles"))
     actions = []
@@ -223,12 +304,34 @@ def reconcile(specs, admitted, runner=run, **kwargs):
     return actions
 
 
+def note_error(message):
+    """Reason of the last refused/failed apply, readable by the widget (best effort)."""
+    try:
+        if message is None:
+            LAST_ERROR.unlink(missing_ok=True)
+        else:
+            LAST_ERROR.write_text(message + "\n")
+            os.chmod(LAST_ERROR, 0o644)
+    except OSError:
+        pass
+
+
+def remember_profile(name):
+    """The profile to restore after the next boot (applied by the reconciler when safe)."""
+    try:
+        DESIRED.parent.mkdir(parents=True, exist_ok=True)
+        DESIRED.write_text(name + "\n")
+    except OSError:
+        pass
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     p = sub.add_parser("apply")
     p.add_argument("profile")
+    p.add_argument("--force", action="store_true", help="skip the KWin-on-AMD safety check")
     p = sub.add_parser("reconcile")
     p.add_argument("--role-unit", action="append", required=True, type=parse_role_unit)
     p.add_argument("--loop", action="store_true")
@@ -243,10 +346,16 @@ def main(argv=None):
             result = status()
         elif args.command == "reconcile":
             admitted = set()
+            state = {}
             while True:
                 try:
-                    for line in reconcile(args.role_unit, admitted):
+                    actions = reconcile(args.role_unit, admitted)
+                    for line in actions:
                         print(line, flush=True)
+                    if args.loop and not actions:  # a stable pass: roles are in sync
+                        message = restore_desired(args.role_unit, state)
+                        if message:
+                            print(message, flush=True)
                 except (RuntimeError, ValueError, OSError) as error:
                     if not args.loop:
                         raise
@@ -255,7 +364,13 @@ def main(argv=None):
                     return 0
                 time.sleep(max(1.0, args.interval))
         elif args.command == "apply":
-            result = apply_profile(args.profile)
+            try:
+                result = apply_profile(args.profile, force=args.force)
+            except (RuntimeError, ValueError) as error:
+                note_error(str(error))
+                raise
+            note_error(None)
+            remember_profile(args.profile)
         else:
             result = enroll(args.index, args.unit, args.exe)
     except (RuntimeError, ValueError, OSError) as error:
