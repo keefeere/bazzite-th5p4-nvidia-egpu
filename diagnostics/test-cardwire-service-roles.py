@@ -242,7 +242,9 @@ def archive_restored():
         base.baseline_matches(json.loads((ROOT / 'before.json').read_text()))
         destination = Path(tempfile.mkdtemp(prefix=ROOT.name + '-archive-', dir=ROOT.parent)) / 'trial'
         ROOT.rename(destination)
-        base.run(['systemctl', 'reset-failed', UNIT + '.service'])
+        # A successful trial leaves no unit to reset; only a failed one does.
+        if base.run(['systemctl', 'show', UNIT + '.service', '-p', 'LoadState', '--value']) != 'not-found':
+            base.run(['systemctl', 'reset-failed', UNIT + '.service'])
         print(f'ARCHIVED: {destination}; no GPU policy or running service changed.', flush=True)
 
 
