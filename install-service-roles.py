@@ -237,6 +237,7 @@ def checked_remove(path, expected_text):
 def uninstall(expected_config=None):
     run(['systemctl', 'disable', '--now', RECONCILE], check=False)
     remove_gui()
+    remove_generator()
     checked_remove(UNIT_FILE, (unit_text(), unit_text('Requires')))  # Requires: first release
     run(['systemctl', 'stop', 'cardwired.service'], timeout=90)
     run(['systemctl', 'clean', '--what=fdstore', 'cardwired.service'], check=False)

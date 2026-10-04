@@ -180,6 +180,41 @@ class Installer(unittest.TestCase):
                     inst.remove_gui()
                 self.assertEqual(qml.read_text(), 'ORIGINAL qml')
 
+    def test_full_uninstall_removes_every_piece_it_installs(self):
+        # Regression: the generator was installed but never removed by --uninstall, so the next
+        # --install refused. Drive the real uninstall() against temp paths with no system calls.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            files = {
+                'GENERATOR': (root / 'gen/90', inst.GENERATOR_SRC.read_text()),
+                'UNIT_FILE': (root / 'unit.service', inst.unit_text()),
+                'DROPIN': (root / 'dropin.conf', inst.dropin_text()),
+                'CONFIG': (root / 'service-roles.toml', 'initial_profile = "gaming-nvidia"\n'),
+            }
+            for name, (path, text) in files.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            patches = [patch.object(inst, name, path) for name, (path, _) in files.items()]
+            patches += [patch.object(inst, 'SHARE', root / 'share'), patch.object(inst, 'PINS', root / 'pins'),
+                        patch.object(inst, 'run'), patch.object(inst, 'daemon_digest', return_value=inst.OLD_SHA),
+                        patch.object(inst, 'mode', return_value='u 1'),
+                        patch.object(inst, 'desktop_user', side_effect=RuntimeError('no hardware.conf'))]
+            for entry in patches:
+                entry.start()
+            try:
+                inst.uninstall()
+            finally:
+                for entry in patches:
+                    entry.stop()
+            for name, (path, _) in files.items():
+                self.assertFalse(path.exists(), f'{name} survived --uninstall')
+
+    def test_install_and_uninstall_cover_the_same_system_files(self):
+        source = Path(inst.__file__).read_text()
+        for installer, remover in (('install_generator()', 'remove_generator()'), ('install_gui()', 'remove_gui()')):
+            self.assertIn(installer, source)
+            self.assertGreaterEqual(source.count(remover), 2, f'{remover} is defined but never called')
+
     def test_only_known_actions(self):
         self.assertEqual(set(inst.ACTIONS), {'--install', '--uninstall', '--status'})
 
