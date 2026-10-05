@@ -1,6 +1,7 @@
 """Offline guards for the persistent installer. No host service/GPU access."""
 import importlib.util
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -29,7 +30,8 @@ class Installer(unittest.TestCase):
         text = inst.unit_text()
         self.assertIn('After=cardwired.service', text)
         self.assertIn('--loop', text)
-        self.assertEqual(text.count('--role-unit'), 2)
+        self.assertEqual(text.count('--role-unit'), 3)
+        self.assertIn('3:user:plasma-ksystemstats.service:' + inst.KSYSTATS_EXE, text)
         self.assertIn('0:user:llama.service:' + inst.LLAMA_EXE, text)
         self.assertIn('1:user:plasma-kwin_wayland.service:' + inst.KWIN_EXE, text)
         self.assertIn('Restart=always', text)
@@ -262,6 +264,16 @@ class Installer(unittest.TestCase):
             self.assertEqual(len(profile['permissions']), 3)
         work = {p['name']: p for p in parsed['profile']}['work-nvidia']
         self.assertEqual(work['permissions'][2], work['permissions'][0])  # compute role = compute devices
+
+    def test_role_indexes_match_config_order_and_placeholders_are_distinct(self):
+        # reconcile specs use index N; the generated config must put that exe at position N
+        order = [inst.LLAMA_EXE, inst.KWIN_EXE, inst.NVSMI_EXE, inst.KSYSTATS_EXE]
+        for spec in inst.role_args():
+            index, scope, unit, exe, uid = spec.split(':')
+            self.assertEqual(order[int(index)], exe)
+        source = Path(inst.__file__).read_text()
+        placeholders = re.findall(r"/sys/fs/cgroup/([\w.-]+):", source[source.index('def config_text'):source.index('def write_new')])
+        self.assertEqual(len(placeholders), len(set(placeholders)) , placeholders)  # shared refs cannot be re-enrolled
 
     def test_only_known_actions(self):
         self.assertEqual(set(inst.ACTIONS), {'--install', '--uninstall', '--status'})
