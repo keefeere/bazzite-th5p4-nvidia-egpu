@@ -134,6 +134,21 @@ def unit_text(dependency='Wants'):
             '[Install]\nWantedBy=multi-user.target\n')
 
 
+def remove_unit_file():
+    """Remove the reconcile unit if it is ANY version of ours (role list and Wants/Requires vary)."""
+    if UNIT_FILE.is_symlink():
+        raise RuntimeError(f'Refusing symlink: {UNIT_FILE}')
+    if not UNIT_FILE.exists():
+        return
+    roles = ' '.join(f'--role-unit {r}' for r in role_args())
+    template = unit_text('XDEPX').replace(roles, 'XROLESX')
+    pattern = (re.escape(template).replace('XDEPX', '(?:Wants|Requires)')
+               .replace('XROLESX', r'--role-unit \S+(?: --role-unit \S+)*'))
+    if not re.fullmatch(pattern, UNIT_FILE.read_text()):
+        raise RuntimeError(f'Refusing changed file: {UNIT_FILE}')
+    UNIT_FILE.unlink()
+
+
 def config_text():
     generator = load(HERE / 'egpu-service-roles-config.py', 'generator')
     planner = load(HERE / 'egpu-desktop-profile-plan.py', 'planner')
@@ -312,7 +327,7 @@ def uninstall(expected_config=None):
     remove_gui()
     remove_nvidia_smi()
     remove_generator()
-    checked_remove(UNIT_FILE, (unit_text(), unit_text('Requires')))  # Requires: first release
+    remove_unit_file()
     run(['systemctl', 'stop', 'cardwired.service'], timeout=90)
     run(['systemctl', 'clean', '--what=fdstore', 'cardwired.service'], check=False)
     remove_pins()

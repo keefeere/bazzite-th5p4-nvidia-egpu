@@ -275,6 +275,25 @@ class Installer(unittest.TestCase):
         placeholders = re.findall(r"/sys/fs/cgroup/([\w.-]+):", source[source.index('def config_text'):source.index('def write_new')])
         self.assertEqual(len(placeholders), len(set(placeholders)) , placeholders)  # shared refs cannot be re-enrolled
 
+    def test_every_released_reconcile_unit_can_be_removed_but_edits_cannot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = Path(tmp) / 'u.service'
+            two_roles = inst.unit_text().replace(' --role-unit ' + inst.role_args()[2], '')
+            variants = [inst.unit_text(), inst.unit_text('Requires'), two_roles, two_roles.replace('Wants=', 'Requires=')]
+            self.assertEqual(variants[2].count('--role-unit'), 2)  # the release that failed in the field
+            with patch.object(inst, 'UNIT_FILE', unit):
+                for text in variants:
+                    unit.write_text(text)
+                    inst.remove_unit_file()
+                    self.assertFalse(unit.exists())
+                unit.write_text(inst.unit_text() + 'ExecStartPost=/bin/evil\n')
+                with self.assertRaisesRegex(RuntimeError, 'changed'):
+                    inst.remove_unit_file()
+                self.assertTrue(unit.exists())
+                unit.write_text(inst.unit_text().replace('reconcile --loop', 'reconcile --other'))
+                with self.assertRaisesRegex(RuntimeError, 'changed'):
+                    inst.remove_unit_file()
+
     def test_only_known_actions(self):
         self.assertEqual(set(inst.ACTIONS), {'--install', '--uninstall', '--status'})
 
