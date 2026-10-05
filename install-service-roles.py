@@ -25,7 +25,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 DIST = Path('/var/home/keefeere/_repos/_home/cardwire-stable-process-access/dist')
-DAEMON_SHA = '9cc15a1d06a9db1e29fd6898e1e81821122853573d29da2b60c74021df0478b2'
+DAEMON_SHA = '61b212982d7c33909f769516f9f12b86f36dfa384f23dd3b7fa9d2c5c7e10bee'
 OBJECT_SHA = 'e6b22a22cf515f510b830ce1aecab368dd71f23ece3d168ff0a0b996347f84d0'
 CANDIDATE = DIST / f'local-service-roles-{DAEMON_SHA[:16]}'
 RELEASE = Path('/var/opt/cardwire-fork/releases') / f'service-roles-{DAEMON_SHA[:16]}'
