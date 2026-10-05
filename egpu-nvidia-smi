@@ -3,9 +3,10 @@
 # egpu-nvidia-smi.service (a fixed service role) and prints its output. Manual, no loops.
 set -u
 unit=egpu-nvidia-smi.service
+since=$(date '+%Y-%m-%d %H:%M:%S')
 if ! systemctl start "$unit"; then
     echo "egpu-nvidia-smi: the service failed (is the service-roles install active?)" >&2
 fi
-invocation=$(systemctl show "$unit" -p InvocationID --value)
-[[ -n $invocation ]] || { echo "egpu-nvidia-smi: no output recorded" >&2; exit 1; }
-journalctl --no-pager -o cat "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null
+# Print only nvidia-smi's own report: from its date line up to systemd's "Finished" line.
+journalctl --no-pager -o cat -u "$unit" --since "$since" 2>/dev/null \
+    | awk '/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) /{p=1} /^(Finished|Deactivated) /{p=0} /^egpu-nvidia-smi.service:/{p=0} p'
