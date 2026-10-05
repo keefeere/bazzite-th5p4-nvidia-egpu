@@ -1,0 +1,9 @@
+[Unit]
+Description=Run nvidia-smi once under its own service role (manual, see ~/.local/bin/egpu-nvidia-smi)
+
+[Service]
+Type=oneshot
+# The leading "-" tolerates an inactive guard (then nvidia-smi simply works), "+" gives the
+# step root rights. This unit's cgroup is new on every run, so the role is re-bound before exec.
+ExecStartPre=-+/usr/bin/python3 /var/opt/egpu-nvidia-service-roles/egpu-service-roles-ctl.py enroll 2 egpu-nvidia-smi.service --exe /usr/bin/nvidia-smi
+ExecStart=/usr/bin/nvidia-smi

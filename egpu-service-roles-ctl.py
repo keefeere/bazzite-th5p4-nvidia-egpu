@@ -167,7 +167,7 @@ def enroll(index, unit, exe=None, runner=run, cgroup_root=Path("/sys/fs/cgroup")
     if exe is not None and (not exe.startswith("/") or ".." in exe.split("/")):
         raise ValueError("absolute executable path required")
     cgroup = unit_cgroup(unit, runner, cgroup_root)
-    executable = exe or unit_executable(unit, runner)
+    executable = os.path.realpath(exe or unit_executable(unit, runner))
     out = busctl(runner, "call", SERVICE, OBJECT, IFACE, "ReEnrollRole", "uss",
                  str(index), executable, cgroup)
     return {"generation": parse_value(out), "executable": executable, "cgroup": cgroup}

@@ -8,6 +8,8 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
+if os.geteuid() == 0:  # tests drive uninstall(); they must never be able to touch the real system
+    sys.exit('Refusing to run the installer tests as root')
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location(
     'inst', Path(__file__).resolve().parents[1] / 'install-service-roles.py')
@@ -190,6 +192,9 @@ class Installer(unittest.TestCase):
                 'UNIT_FILE': (root / 'unit.service', inst.unit_text()),
                 'DROPIN': (root / 'dropin.conf', inst.dropin_text()),
                 'CONFIG': (root / 'service-roles.toml', 'initial_profile = "gaming-nvidia"\n'),
+                'PROFILE_UNIT': (root / 'profile@.service', inst.PROFILE_UNIT_SRC.read_text()),
+                'POLKIT': (root / 'rule.rules', inst.polkit_text('u')),
+                'NVSMI_UNIT': (root / 'smi.service', inst.NVSMI_UNIT_SRC.read_text()),
             }
             for name, (path, text) in files.items():
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,6 +204,8 @@ class Installer(unittest.TestCase):
                         patch.object(inst, 'run'), patch.object(inst, 'daemon_digest', return_value=inst.OLD_SHA),
                         patch.object(inst, 'mode', return_value='u 1'),
                         patch.object(inst, 'desktop_user', side_effect=RuntimeError('no hardware.conf'))]
+            for real in (inst.GENERATOR, inst.UNIT_FILE, inst.DROPIN, inst.CONFIG, inst.PROFILE_UNIT, inst.POLKIT, inst.NVSMI_UNIT):
+                self.assertNotIn(str(real), [str(p) for p, _ in files.values()])  # never the real paths
             for entry in patches:
                 entry.start()
             try:
@@ -214,6 +221,47 @@ class Installer(unittest.TestCase):
         for installer, remover in (('install_generator()', 'remove_generator()'), ('install_gui()', 'remove_gui()')):
             self.assertIn(installer, source)
             self.assertGreaterEqual(source.count(remover), 2, f'{remover} is defined but never called')
+
+    def test_polkit_rule_is_removed_without_hardware_conf_and_never_if_edited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rule = Path(tmp) / 'rule.rules'
+            with patch.object(inst, 'POLKIT', rule):
+                for text in (inst.polkit_text('anyone'), inst.LEGACY_POLKIT_TEMPLATE.replace('@DESKTOP_USER@', 'other.user')):
+                    rule.write_text(text)
+                    inst.remove_polkit()
+                    self.assertFalse(rule.exists())
+                rule.write_text(inst.polkit_text('u') + '// local edit\n')
+                with self.assertRaisesRegex(RuntimeError, 'changed'):
+                    inst.remove_polkit()
+                self.assertTrue(rule.exists())
+                rule.unlink()
+                inst.remove_polkit()  # absent: fine
+
+    def test_nvidia_smi_is_a_manual_service_role_without_automation(self):
+        unit = inst.NVSMI_UNIT_SRC.read_text()
+        self.assertIn('Type=oneshot', unit)
+        self.assertEqual(unit.count('ExecStart='), 1)
+        self.assertIn('enroll 2 egpu-nvidia-smi.service --exe /usr/bin/nvidia-smi', unit)
+        self.assertNotIn('WantedBy', unit)  # never started automatically
+        self.assertNotIn('Timer', unit)
+        self.assertIn('"egpu-nvidia-smi.service"', inst.polkit_text('u'))
+        wrapper = inst.NVSMI_WRAPPER_SRC.read_text()
+        self.assertIn('systemctl start', wrapper)
+        self.assertNotIn('sudo', wrapper)
+        self.assertNotIn('while', wrapper)  # no loops
+
+    def test_generated_config_has_the_nvidia_smi_role_as_index_two(self):
+        gen = inst.load(inst.HERE / 'egpu-service-roles-config.py', 'g2')
+        nodes = [('/dev/dri/card0', {'display'}), ('/dev/nvidia0', {'compute', 'display'}), ('/dev/nvidiactl', {'compute', 'display'})]
+        roles = [('compute', '/bin/sh', '/sys/fs/cgroup/system.slice', 1000), ('display', '/bin/true', '/sys/fs/cgroup/user.slice', 1000),
+                 ('compute', '/bin/cat', '/sys/fs/cgroup/init.scope', 0)]
+        parsed = tomllib.loads(gen.render(nodes, roles, '/o', initial_profile='gaming-nvidia'))
+        self.assertEqual(len(parsed['role']), 3)
+        self.assertEqual(parsed['role'][2]['uid'], 0)
+        for profile in parsed['profile']:
+            self.assertEqual(len(profile['permissions']), 3)
+        work = {p['name']: p for p in parsed['profile']}['work-nvidia']
+        self.assertEqual(work['permissions'][2], work['permissions'][0])  # compute role = compute devices
 
     def test_only_known_actions(self):
         self.assertEqual(set(inst.ACTIONS), {'--install', '--uninstall', '--status'})

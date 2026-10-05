@@ -1,0 +1,11 @@
+#!/usr/bin/bash
+# Show nvidia-smi even under a Work profile: runs it as the allowed service
+# egpu-nvidia-smi.service (a fixed service role) and prints its output. Manual, no loops.
+set -u
+unit=egpu-nvidia-smi.service
+if ! systemctl start "$unit"; then
+    echo "egpu-nvidia-smi: the service failed (is the service-roles install active?)" >&2
+fi
+invocation=$(systemctl show "$unit" -p InvocationID --value)
+[[ -n $invocation ]] || { echo "egpu-nvidia-smi: no output recorded" >&2; exit 1; }
+journalctl --no-pager -o cat "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null
