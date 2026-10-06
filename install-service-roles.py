@@ -64,6 +64,13 @@ polkit.addRule(function(action, subject) {
     }
 });
 '''
+KSYSTATS_DROPIN_REL = '.config/systemd/user/plasma-ksystemstats.service.d/egpu-service-roles.conf'
+# ksystemstats initialises NVML at start, before the reconciler (every 5 s) can bind its new cgroup.
+KSYSTATS_DROPIN_TEXT = (
+    '[Service]\n'
+    '# Added by install-service-roles.py: let the service-roles reconciler bind this unit\'s new cgroup\n'
+    '# BEFORE ksystemstats starts, so its NVIDIA sensors work under a Work profile.\n'
+    'ExecStartPre=/usr/bin/sleep 6\n')
 GENERATOR_SRC = HERE / 'egpu-kwin-order-generator.sh'
 GENERATOR = Path('/etc/systemd/user-environment-generators/90-egpu-kwin-order')
 PINS = Path('/sys/fs/bpf/cardwire-service-roles')
@@ -199,6 +206,39 @@ def wrapper_path(user):
     return Path(pwd.getpwnam(user).pw_dir) / '.local/bin/egpu-nvidia-smi'
 
 
+def ksystats_dropin_path(user):
+    return Path(pwd.getpwnam(user).pw_dir) / KSYSTATS_DROPIN_REL
+
+
+def install_ksystemstats_dropin():
+    user = desktop_user()
+    target = ksystats_dropin_path(user)
+    info = pwd.getpwnam(user)
+    home = Path(info.pw_dir)
+    for directory in reversed([d for d in target.parents if home in d.parents]):
+        if not directory.exists():
+            directory.mkdir(mode=0o755)
+            os.chown(directory, info.pw_uid, info.pw_gid)
+    write_new(target, KSYSTATS_DROPIN_TEXT, 0o644)
+    os.chown(target, info.pw_uid, info.pw_gid)
+    # Best effort: the user manager re-reads units now (otherwise at the next login).
+    run(['runuser', '-u', user, '--', 'env', f'XDG_RUNTIME_DIR=/run/user/{info.pw_uid}',
+         'systemctl', '--user', 'daemon-reload'], check=False)
+
+
+def remove_ksystemstats_dropin():
+    try:
+        user = desktop_user()
+    except Exception:
+        return  # hardware.conf gone: leave the user's file alone
+    target = ksystats_dropin_path(user)
+    checked_remove(target, KSYSTATS_DROPIN_TEXT)
+    try:
+        target.parent.rmdir()  # only when empty
+    except OSError:
+        pass
+
+
 def install_nvidia_smi():
     """The manual `egpu-nvidia-smi` command: one fixed service role, no timers, no loops."""
     user = desktop_user()
@@ -326,6 +366,7 @@ def uninstall(expected_config=None):
     run(['systemctl', 'disable', '--now', RECONCILE], check=False)
     remove_gui()
     remove_nvidia_smi()
+    remove_ksystemstats_dropin()
     remove_generator()
     remove_unit_file()
     run(['systemctl', 'stop', 'cardwired.service'], timeout=90)
@@ -392,6 +433,11 @@ def install():
                 raise RuntimeError(f'Reconciler did not enroll/admit KWin in time: {log[-400:]}')
             time.sleep(2)
         install_generator()
+        try:
+            install_ksystemstats_dropin()
+        except Exception as error:
+            remove_ksystemstats_dropin()
+            print(f'ksystemstats drop-in NOT installed ({error})', file=sys.stderr)
         try:
             install_nvidia_smi()
         except Exception as error:

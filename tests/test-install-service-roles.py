@@ -220,7 +220,9 @@ class Installer(unittest.TestCase):
 
     def test_install_and_uninstall_cover_the_same_system_files(self):
         source = Path(inst.__file__).read_text()
-        for installer, remover in (('install_generator()', 'remove_generator()'), ('install_gui()', 'remove_gui()')):
+        for installer, remover in (('install_generator()', 'remove_generator()'), ('install_gui()', 'remove_gui()'),
+                                   ('install_ksystemstats_dropin()', 'remove_ksystemstats_dropin()'),
+                                   ('install_nvidia_smi()', 'remove_nvidia_smi()')):
             self.assertIn(installer, source)
             self.assertGreaterEqual(source.count(remover), 2, f'{remover} is defined but never called')
 
@@ -293,6 +295,26 @@ class Installer(unittest.TestCase):
                 unit.write_text(inst.unit_text().replace('reconcile --loop', 'reconcile --other'))
                 with self.assertRaisesRegex(RuntimeError, 'changed'):
                     inst.remove_unit_file()
+
+    def test_ksystemstats_dropin_waits_for_the_reconciler_and_is_removed_only_if_unchanged(self):
+        self.assertIn('ExecStartPre=/usr/bin/sleep 6', inst.KSYSTATS_DROPIN_TEXT)
+        self.assertNotIn('sudo', inst.KSYSTATS_DROPIN_TEXT)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            owner = type('P', (), {'pw_dir': str(home), 'pw_uid': os.getuid(), 'pw_gid': os.getgid()})()
+            with patch.object(inst, 'desktop_user', return_value='u'), patch.object(inst.pwd, 'getpwnam', return_value=owner), \
+                    patch.object(inst, 'run'), patch.object(inst.os, 'chown'):
+                inst.install_ksystemstats_dropin()
+                target = inst.ksystats_dropin_path('u')
+                self.assertEqual(target.read_text(), inst.KSYSTATS_DROPIN_TEXT)
+                with self.assertRaisesRegex(RuntimeError, 'Existing state'):
+                    inst.install_ksystemstats_dropin()
+                target.write_text(inst.KSYSTATS_DROPIN_TEXT + '# my edit\n')
+                with self.assertRaisesRegex(RuntimeError, 'changed'):
+                    inst.remove_ksystemstats_dropin()
+                target.write_text(inst.KSYSTATS_DROPIN_TEXT)
+                inst.remove_ksystemstats_dropin()
+                self.assertFalse(target.exists())
 
     def test_only_known_actions(self):
         self.assertEqual(set(inst.ACTIONS), {'--install', '--uninstall', '--status'})
