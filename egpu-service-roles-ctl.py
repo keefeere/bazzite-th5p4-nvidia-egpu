@@ -227,7 +227,7 @@ def reconcile_role(spec, roles, admitted, runner=run, cgroup_root=Path("/sys/fs/
     actions = []
     directory = unit_cgroup_dir(spec, cgroup_root)
     if directory is None:
-        return [f"{spec['unit']}: not running"]
+        return [spec["unit"] + NOT_RUNNING]
     index = spec["index"]
     if index >= len(roles):
         raise RuntimeError(f"role {index} is not in the catalog")
@@ -259,6 +259,9 @@ def enroll_paths(index, exe, cgroup, runner=run):
 
 
 MUST_BE_BOUND = ("plasma-kwin_wayland.service",)
+
+
+NOT_RUNNING = ": not running"
 
 
 def all_bound(specs, roles, cgroup_root=Path("/sys/fs/cgroup")):
@@ -302,6 +305,22 @@ def restore_desired(specs, state, runner=run, desired_path=None, cgroup_root=Pat
         return text
     state.pop("last_refusal", None)
     return f"restored remembered profile {desired}"
+
+
+def loop_pass(specs, admitted, state, runner=run, **kwargs):
+    """One pass of the service loop; returns the lines to log. 'Not running' is a state, not a change:
+    it is logged once when it appears and never blocks restoring the remembered profile."""
+    actions = reconcile(specs, admitted, runner, **kwargs)
+    notes = {a for a in actions if a.endswith(NOT_RUNNING)}
+    lines = sorted(notes - state.get("noted", set()))
+    state["noted"] = notes  # a service that runs again is announced again if it stops later
+    changes = [a for a in actions if a not in notes]
+    lines += changes
+    if not changes:  # a stable pass: every running role is in sync
+        message = restore_desired(specs, state, runner)
+        if message:
+            lines.append(message)
+    return lines
 
 
 def reconcile(specs, admitted, runner=run, **kwargs):
@@ -377,13 +396,10 @@ def main(argv=None):
             state = {}
             while True:
                 try:
-                    actions = reconcile(args.role_unit, admitted)
-                    for line in actions:
+                    lines = (loop_pass(args.role_unit, admitted, state) if args.loop
+                             else reconcile(args.role_unit, admitted))
+                    for line in lines:
                         print(line, flush=True)
-                    if args.loop and not actions:  # a stable pass: roles are in sync
-                        message = restore_desired(args.role_unit, state)
-                        if message:
-                            print(message, flush=True)
                 except (RuntimeError, ValueError, OSError) as error:
                     if not args.loop:
                         raise

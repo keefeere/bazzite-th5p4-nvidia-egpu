@@ -342,5 +342,37 @@ class BoundCheck(unittest.TestCase):
         self.assertFalse(ctl.all_bound(self.specs, roles, self.root))  # no KWin: never restore a work profile
 
 
+class LoopPass(unittest.TestCase):
+    def specs(self):
+        return [ctl.parse_role_unit("0:user:a.service:/bin/sh:1000"), ctl.parse_role_unit("3:user:b.service:/bin/sh:1000")]
+
+    def run_pass(self, actions, state, restore=None):
+        with patch.object(ctl, "reconcile", return_value=actions), \
+                patch.object(ctl, "restore_desired", return_value=restore) as restorer:
+            lines = ctl.loop_pass(self.specs(), set(), state)
+        return lines, restorer
+
+    def test_not_running_is_logged_once_and_never_blocks_the_restore(self):
+        state = {}
+        lines, restorer = self.run_pass(["b.service: not running"], state, restore="restored remembered profile x")
+        self.assertEqual(lines, ["b.service: not running", "restored remembered profile x"])
+        restorer.assert_called_once()
+        lines, restorer = self.run_pass(["b.service: not running"], state)
+        self.assertEqual(lines, [])  # not repeated every pass
+        restorer.assert_called_once()  # but the restore is still attempted on every stable pass
+
+    def test_a_real_change_postpones_the_restore(self):
+        lines, restorer = self.run_pass(["a.service: enrolled role 0 (generation 9)", "b.service: not running"], {})
+        self.assertEqual(lines, ["b.service: not running", "a.service: enrolled role 0 (generation 9)"])
+        restorer.assert_not_called()
+
+    def test_a_service_that_stops_again_is_announced_again(self):
+        state = {}
+        self.run_pass(["b.service: not running"], state)
+        self.run_pass([], state)                      # b is running now
+        lines, _ = self.run_pass(["b.service: not running"], state)
+        self.assertEqual(lines, ["b.service: not running"])
+
+
 if __name__ == "__main__":
     unittest.main()
