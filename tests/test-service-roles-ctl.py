@@ -306,5 +306,41 @@ class RequestProfile(unittest.TestCase):
         self.assertFalse(self.desired.exists())
 
 
+class BoundCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        base = self.root / "user.slice/user-1000.slice/user@1000.service/session.slice"
+        self.kwin = base / "plasma-kwin_wayland.service"
+        self.llama = base / "llama.service"
+        self.kwin.mkdir(parents=True)
+        self.llama.mkdir(parents=True)
+        self.specs = [ctl.parse_role_unit(f"{i}:user:{u}:/bin/sh:1000") for i, u in
+                      ((0, "llama.service"), (1, "plasma-kwin_wayland.service"), (3, "plasma-ksystemstats.service"))]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def roles(self, llama, kwin):
+        return [(1, llama, 7, 1000), (1, kwin, 7, 1000), (1, 0, 0, 0), (1, 5, 7, 1000)]
+
+    def test_a_service_that_is_not_running_does_not_block_the_restore(self):
+        # Regression: D-Bus-activated ksystemstats was never running, so the remembered profile was
+        # never restored after a reboot.
+        roles = self.roles(self.llama.stat().st_ino, self.kwin.stat().st_ino)
+        self.assertTrue(ctl.all_bound(self.specs, roles, self.root))
+
+    def test_a_running_but_unbound_service_blocks(self):
+        roles = self.roles(llama=999, kwin=self.kwin.stat().st_ino)
+        self.assertFalse(ctl.all_bound(self.specs, roles, self.root))
+
+    def test_the_compositor_must_be_running_and_bound(self):
+        roles = self.roles(self.llama.stat().st_ino, kwin=999)
+        self.assertFalse(ctl.all_bound(self.specs, roles, self.root))
+        self.kwin.rmdir()
+        roles = self.roles(self.llama.stat().st_ino, 1)
+        self.assertFalse(ctl.all_bound(self.specs, roles, self.root))  # no KWin: never restore a work profile
+
+
 if __name__ == "__main__":
     unittest.main()

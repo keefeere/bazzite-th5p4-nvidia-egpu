@@ -258,13 +258,22 @@ def enroll_paths(index, exe, cgroup, runner=run):
     return parse_value(out)
 
 
+MUST_BE_BOUND = ("plasma-kwin_wayland.service",)
+
+
 def all_bound(specs, roles, cgroup_root=Path("/sys/fs/cgroup")):
-    """Every configured role is bound to its service's CURRENT cgroup."""
+    """Every RUNNING configured service has its role bound to its CURRENT cgroup, and the services in
+    MUST_BE_BOUND (the compositor) are running too. Services that are not running (e.g. D-Bus-activated
+    ksystemstats) cannot be bound and must not block the check forever."""
+    running = set()
     for spec in specs:
         directory = unit_cgroup_dir(spec, cgroup_root)
-        if directory is None or spec["index"] >= len(roles) or roles[spec["index"]][1] != directory.stat().st_ino:
+        if directory is None:
+            continue
+        running.add(spec["unit"])
+        if spec["index"] >= len(roles) or roles[spec["index"]][1] != directory.stat().st_ino:
             return False
-    return True
+    return all(unit in running for unit in MUST_BE_BOUND if any(s["unit"] == unit for s in specs))
 
 
 def restore_desired(specs, state, runner=run, desired_path=None, cgroup_root=Path("/sys/fs/cgroup"),
