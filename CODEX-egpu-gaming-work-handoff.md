@@ -396,6 +396,15 @@ NVIDIA на старті ДО enroll і втратив би вузли (чорн
 - Діє після релогіну. Інсталятор замінює першу, встановлену вручну, версію (за заголовком), чужі файли не чіпає.
 - Лишається відкритим: чи DisplayLinkManager перепідключається до EVDI після USB reconnect (перевірити після релогіну).
 
+### DisplayLink зник після оновлення образу (2026-10-12 13:30)
+
+- Після оновлення Bazzite до 44.20261012 / ядро 7.2.9 дисплей StarTech не з'явився. Генератор 99-kwin-displaylink працює
+  (EVDI у KWIN_DRM_DEVICES), АЛЕ нового образу немає `/usr/libexec/displaylink/DisplayLinkManager` і `displaylink.service`
+  (були в 20261006.1 як окремий пакет 6.3.0) -> evdi не завантажується, KWin: "Failed to open drm device ...evdi".
+- Фікс: `install-displaylink-persistent.sh` (+ `--remove`, тест 4 OK) копіює DisplayLinkManager (перевіряє SHA 9c6a88b6…) і
+  .spkg зі старого розгортання в /var/opt/displaylink (переживає оновлення), ставить unit і udev-правило в /etc, modprobe evdi.
+  Старе розгортання треба встигнути використати до наступного оновлення (воно його замінить). Нічого пропрієтарного в репо нема.
+
 ### Мета і межі
 
 Три профілі в НАЯВНОМУ eGPU-helper + Cardwire:
