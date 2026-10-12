@@ -257,6 +257,145 @@ llama — USER-сервіс, а ReEnrollRole root-only: user-unit не може 
 - Лишається: work-igpu на залізі, реальне відкриття вузлів KWin під роллю при його рестарті (логаут), довге
   використання, push (користувач запушить сам).
 
+### Оновлення 2026-10-04 17:20: встановлення ПЕРЕВСТАНОВЛЕНО з Wants, work-igpu PASSED, ПІСЛЯ РЕБУТУ перевірено
+
+- work-igpu на залізі (17:09): плоский процес відмовлено (errno 13), KWin відповідає, llama HTTP 200, повернення до
+  gaming; nvidia-smi у вікні "Insufficient Permissions" (очікувано).
+- Після ребуту (14:25): guard НЕ піднявся на старті (`cannot open /dev/dri/card0` — eGPU ще не було) -> cardwired
+  у legacy (Gaming-еквівалент); guard створюється, коли cardwired (пере)стартує з eGPU (17:02). reconcile чекав на
+  інтерфейс і повторював (як задумано), але `Requires=cardwired` зупинив його при stop cardwired. Фікс `Wants=`
+  (commit 63d2ca2); користувач виконав `--uninstall && --install` (17:16): reconcile active, ролі прив'язані до
+  ПОТОЧНИХ cgroup (llama 23832, kwin 24552), gaming-nvidia, Hybrid, 0 AVC.
+- Підтверджено на залізі ВСЕ, крім: реальне відкриття вузлів KWin під роллю при його рестарті (логаут), довге
+  використання, автопідйом guard на ранньому boot без eGPU (зараз лише при рестарті cardwired з eGPU), push.
+
+### Логаут-перевірка (план, 2026-10-04 17:30)
+
+Стан ДО: профіль gaming-nvidia, Roles = (inc 3, cgroup 23832 llama), (inc 4, cgroup 24552 kwin), reconcile active.
+Мета: після логауту/логіну перевірити, що reconcile (а) бачить НОВІ cgroup user-сервісів, (б) робить enroll
+(Roles змінюються, incarnation росте), (в) admit-ить нові pid llama і kwin_wayland, (г) 0 AVC, KWin/llama живі.
+БЕЗПЕЧНІСТЬ: профіль лишається gaming-nvidia; work-профіль до/під час логіну НЕ застосовувати — KWin відкриває
+NVIDIA на старті ДО enroll і втратив би вузли (чорний екран). "Реальне відкриття вузлів KWin під роллю на старті"
+через це недосяжне без pre-enrolled cgroup; замінено перевіркою життєвого циклу ролей.
+
+### Логаут-перевірка PASSED (2026-10-04 19:29)
+
+- Після логауту/логіну: `plasma-kwin_wayland.service: enrolled role 1 (generation 7)` + `admitted pid 310385` (19:28:40,
+  нова cgroup 41672); llama після рестарту (18:17-18:18): `enrolled role 0 (generation 5, 6)` + admitted. Roles збігаються
+  з живими cgroup-ами (llama 36831, kwin 41672), gaming-nvidia, Hybrid, reconcile+cardwired active, 0 AVC, nvidia-smi OK.
+- Лишається (за бажанням користувача): автоперезапуск cardwired при появі eGPU на ранньому boot, довге використання, push.
+  Реальне відкриття вузлів KWin під роллю на старті свідомо НЕ тестується (чорний екран під work-профілем).
+
+### Push виконано; автоперезапуск НЕ потрібен (2026-10-04 19:40)
+
+- Push (за згодою користувача): helper `main` 31153ed..63d2ca2 (keefeere/bazzite-th5p4-nvidia-egpu);
+  fork `backport/v0.12.3-secure-policy` 6213983..1cb3c6f (keefeere/cardwire). Секретів у дифі немає.
+- eGPU hot-attach (`egpu-nvidia-hot-attach.service`) САМ зупиняє cardwired перед підключенням і запускає після появи
+  NVIDIA-вузлів (17:02:12 stop -> 17:02:27 start -> `created generation 2`) і перезапускає графічну сесію;
+  reconcile потім admit-ить нові KWin/llama. Тому автоперезапуск cardwired при появі eGPU не потрібен.
+  Без eGPU на boot guard не піднімається (legacy = Gaming-еквівалент); з cold-attached eGPU вузли є до старту.
+- Перемикання профілів: GUI НЕМАЄ (лише CLI): `sudo python3 /var/opt/egpu-nvidia-service-roles/egpu-service-roles-ctl.py
+  status | apply work-nvidia | apply work-igpu | apply gaming-nvidia`. Запропоновано пункт у трей через pkexec.
+
+### GUI перемикання профілів (2026-10-04 20:00) — написано, НЕ встановлено
+
+- Plasmoid com.keefeere.egpu 1.3.0: секція "Профіль GPU" (поточний профіль читається через
+  `busctl get-property ... CurrentProfile` без привілеїв; три кнопки Gaming / Work: NVIDIA displays /
+  Work: iGPU displays, tooltip-пояснення; ховається, якщо інтерфейсу ServiceRoles нема).
+  Застосування: `systemctl start egpu-service-roles-profile@<profile>.service` (шаблон-unit oneshot ->
+  ctl apply %i) + polkit-правило `49-egpu-service-roles.rules.in` з ТРЬОМА точними іменами unit-ів для
+  активного локального користувача (без wildcard; той самий патерн, що 49-egpu-nvidia.rules).
+- install-service-roles.py --install тепер ставить GUI-частину (unit, polkit, віджет із бекапом
+  `*.pre-service-roles`), --uninstall відновлює; збій GUI не відкочує ядро. Тести 14 OK, весь suite зелений.
+- QML лінтера на хості нема: перевірено лише статично (баланс дужок, рядки). Потрібен ручний перегляд віджета.
+
+### Профіль = порядок GPU + релогін (2026-10-04 22:00) — написано, НЕ встановлено
+
+- Перший реальний тест користувача: під work-nvidia віджет і нові програми не малювались, бо KWin рендерить на
+  NVIDIA (KWIN_DRM_DEVICES=card0:card1 з /etc/environment.d/10kwin-egpu.conf, яким керує egpu-nvidia-boot.service).
+  Профіль скидався до Ігор при кожному рестарті cardwired. Я повернув Ігри; додано запобіжник (preflight).
+- Модель (обрана користувачем): профіль = порядок GPU для KWin + guard + ОДИН релогін. KWin читає порядок при
+  старті сеансу, динамічно його змінити не можна (як у Windows — ні; динамічність лише на рівні програм/offload).
+- Реалізація (не чіпає egpu-nvidia-boot.service): `egpu-kwin-order-generator.sh` — systemd user-environment-generator,
+  при кожному вході: якщо збережено work-* і є AMD+NVIDIA, друкує KWIN_DRM_DEVICES=AMD:NVIDIA (за PCI-vendor, не
+  за номерами card), інакше нічого. `ctl apply` = request_profile: вибір ЗАВЖДИ запам'ятовується; work-* застосовується
+  одразу лише якщо KWin вже на AMD, інакше "pending-relogin" (reconcile застосує після входу). Gaming — завжди одразу.
+  Віджет: "Обрано: …", банер "Збережено. Перезапусти сеанс…" + кнопка (KDE promptLogout, з підтвердженням).
+  Інсталятор ставить/видаляє генератор (/etc/systemd/user-environment-generators/90-egpu-kwin-order) і розпізнає
+  попередні версії віджета за вмістом. Тести: весь suite зелений (ctl 22, інсталятор 17, генератор 4).
+- Інструмент у /var/opt і віджет оновляться при `--uninstall && --install`. QML лише статично перевірено.
+
+### РЕАЛЬНИЙ ТЕСТ ПРОЙДЕНО: work-nvidia після повного ребуту (2026-10-05 12:18)
+
+- Boot 12:12:25, профіль `work-nvidia` обрано у віджеті раніше (збережено в desired-profile). Після ребуту БЕЗ ручних дій:
+  генератор -> `KWIN_DRM_DEVICES=card1:card0` (AMD першою, за vendor); KWin рендерить на AMD (`OpenGL renderer: AMD Radeon 890M`);
+  guard створено при старті (eGPU вже була в boot), reconcile: enrolled llama (gen 3), enrolled+admitted KWin (gen 4),
+  `restored remembered profile work-nvidia` через ~5 с після admit KWin; DP-7, HDMI-A-1, eDP-1 enabled;
+  нові процеси: Vulkan бачить AMD (RADV) + llvmpipe, NVIDIA нема; plain open nvidia0 -> errno 13; llama HTTP 200.
+- 2 AVC за boot — це `tuned` (chcon, mac_admin), не наші.
+- Підтверджено: профіль = порядок GPU + guard + один релогін; пам'ять профілю переживає ребут; порядок "спочатку KWin,
+  потім guard" безпечний (немає чорного екрана); інсталятор install/uninstall/перевстановлення.
+- Лишається: оцінка продуктивності/затримки NVIDIA-дисплеїв при AMD-first, offload ігор на NVIDIA (профіль gaming
+  дозволяє; у work NVIDIA лише ролям), довге використання, push (нові коміти після 63d2ca2 НЕ запушені).
+
+### Дозволені програми для оцінки схеми (2026-10-05) — написано, НЕ встановлено
+
+- Користувач хоче бачити роботу схеми під Work: дозволено дві ролі (без автоматизації):
+  role 2 = `nvidia-smi` (root) через oneshot `egpu-nvidia-smi.service` (ExecStartPre=-+ enroll перед кожним запуском) і
+  команду `~/.local/bin/egpu-nvidia-smi` (systemctl start + вивід з journal); polkit дозволяє старт саме цього unit-а;
+  role 3 = `/usr/bin/ksystemstats` (user-сервіс plasma-ksystemstats; NVML читається всередині нього — у журналі
+  "Could not retrieve information for NVidia GPU 0000:03:00.0") з reconcile `--role-unit 3:user:...`; GUI
+  Plasma System Monitor читає через ksystemstats, окремої ролі не потребує.
+- Ресурси (Flatpak net.nokyan.Resources) у ролі НЕ додаються: scope `app-flatpak-...-<число>.scope` нова при кожному запуску,
+  NVML читається в самому процесі. Показує "Невідомо" для NVIDIA під Work — це наочна демонстрація guard.
+- РИЗИК, перевіряється лише на хості: exe на composefs/overlay (/usr/bin/nvidia-smi, /usr/bin/ksystemstats) —
+  чи збігаються inode/dev BPF-ідентичності (урок btrfs); якщо роль не збігається, діагностувати superblock/inode.
+- Після install: NVML у ksystemstats ініціалізується на старті, ЩЕ до admit (~5 с); якщо дані NVIDIA не з'являються,
+  потрібен `systemctl --user restart plasma-ksystemstats` (reconcile допустить новий pid).
+- Тести: інсталятор 23 OK; тести тепер відмовляються працювати від root (раніше повний uninstall() у тесті міг торкнутися
+  реальних шляхів).
+
+### SELinux: exe FD більше не в systemd (2026-10-05 12:55)
+
+- Інсталяція з роллю nvidia-smi впала: `AVC denied { ioctl } ... comm=systemd path=/usr/bin/nvidia-smi
+  tcontext=xserver_exec_t` -> PID1 не зберіг exe FD -> "unexpected owner FD store count" -> guard disabled -> відкат.
+  Той самий клас, що NVIDIA-вузли. Фікс: виконувані файли НЕ зберігаються в FD store; `adopt(held, devices, executables,
+  ...)` перевідкриває шляхи з конфігу і звіряє inode+st_dev (`Registration::from_held`). names() тепер лише manifest + cgroup.
+  VM: інтегрований 2/2, persistent, suite PASS. Нова збірка dist/local-service-roles-61b212982d7c3390.
+- Узагальнення: systemd (init_t) не може ioctl-ити багато типів файлів; у FD store зберігаємо ЛИШЕ cgroup-каталоги і manifest.
+- Інсталятор: `--uninstall` тепер розпізнає КОЖНУ випущену версію reconcile-unit (шаблон, не точний текст); тести інсталятора 24.
+
+### Роль nvidia-smi + ksystemstats ВСТАНОВЛЕНО (2026-10-05 13:30)
+
+- Інсталяція пройшла (SELinux-фікс exe FD). Roles = 4 (llama, kwin, nvidia-smi, ksystemstats). `~/.local/bin/egpu-nvidia-smi`
+  працює (gaming): oneshot egpu-nvidia-smi.service, роль 2 прив'язується ExecStartPre (incarnation росте на кожен запуск),
+  вивід береться з journal за часом запуску (InvocationID порожній для завершеного oneshot).
+- ksystemstats D-Bus-активований: коли не запущений, reconcile пише "not running" (норма); після старту роль прив'язується
+  за <=5 с. РИЗИК: NVML ініціалізується на старті ksystemstats ДО enroll; якщо під Work у System Monitor нема NVIDIA —
+  розглянути user drop-in `ExecStartPre=systemctl start egpu-...-enroll-ksystemstats.service` (polkit oneshot -> ctl
+  reconcile), тоді admit відбувається ДО exec.
+- Роль nvidia-smi/ksystemstats під Work ще НЕ перевірено (потрібен релогін у Work з AMD-first). Збережено desired=work-igpu;
+  монітори DP-7/HDMI-A-1 на NVIDIA, тож для тесту доречніший work-nvidia ("дисплеї NVIDIA").
+
+### Work-профіль ПРАЦЮЄ на реальному залізі з ролями; доводка ksystemstats (2026-10-06 18:30)
+
+- Після виправлення restore (not-running не блокує; loop_pass) `work-nvidia` відновився сам (`restored remembered profile`),
+  під ним: звичайний nvidia-smi/open nvidia0 -> відмова; `egpu-nvidia-smi` (роль 2 на composefs) працює; KWin на AMD
+  (radeonsi) і відповідає; llama HTTP 200; 0 AVC. Роль на overlay/composefs збігається (на відміну від btrfs до фіксу).
+- ksystemstats: роль enrolled+admitted (gen 9) через ~3 с після старту, але NVML ініціалізується ДО admit ->
+  "Could not retrieve information for NVidia GPU". Фікс без привілеїв: user drop-in `ExecStartPre=/usr/bin/sleep 6`
+  (~/.config/systemd/user/plasma-ksystemstats.service.d/egpu-service-roles.conf), інсталятор ставить/видаляє (+ тести 25).
+  Чекає на перевстановлення користувачем і перевірку NVIDIA-датчиків у System Monitor.
+
+### DisplayLink (StarTech 17e9:4301) у KWin (2026-10-12)
+
+- Симптом: після USB-перепідключення дисплей DisplayLink не з'являвся. Причина в конфігурації: `KWIN_DRM_DEVICES` (від
+  10kwin-egpu.conf / 90-egpu-kwin-order) містив лише AMD і NVIDIA, EVDI-карти не було. Фікс: user-environment-generator
+  `99-kwin-displaylink` ДОПИСУЄ EVDI в кінець списку, зберігаючи порядок GPU (`egpu-kwin-displaylink-generator.sh`,
+  інсталятор `install-kwin-displaylink.sh [--remove]`, тест `tests/test-kwin-displaylink-generator.py`, 5 OK).
+- Діє після релогіну. Інсталятор замінює першу, встановлену вручну, версію (за заголовком), чужі файли не чіпає.
+- Лишається відкритим: чи DisplayLinkManager перепідключається до EVDI після USB reconnect (перевірити після релогіну).
+
 ### Мета і межі
 
 Три профілі в НАЯВНОМУ eGPU-helper + Cardwire:
