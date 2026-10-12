@@ -2,7 +2,9 @@
 # Keep the DisplayLink 6.3.0 driver across Bazzite updates (an image update dropped it).
 # Copies DisplayLinkManager (+ firmware .spkg files) from an older deployment that still has it into
 # /var/opt/displaylink (survives updates), installs a systemd unit and udev rule under /etc, and
-# loads evdi. Nothing proprietary is stored in this repository. Needs root. --remove undoes it.
+# loads evdi. Nothing proprietary is stored in this repository (the driver is Synaptics' and the
+# repo is public). Keep a private backup and pass it as DISPLAYLINK_SOURCE_DIR=<dir> sudo -E bash ...
+# Needs root. --remove undoes it.
 set -euo pipefail
 (( EUID == 0 )) || { echo 'Run with sudo.' >&2; exit 1; }
 DEST=/var/opt/displaylink
@@ -41,7 +43,11 @@ case ${1:-install} in
             [[ ! -e $existing ]] || { echo "Already exists: $existing; inspect it first." >&2; exit 1; }
         done
         [[ ! -e $DEST ]] || { echo "Already exists: $DEST; inspect it first." >&2; exit 1; }
-        if [[ -x /usr/libexec/displaylink/DisplayLinkManager ]]; then
+        # Source order: an explicit DISPLAYLINK_SOURCE_DIR (e.g. a private backup), the system copy,
+        # then older ostree deployments.
+        if [[ -n ${DISPLAYLINK_SOURCE_DIR:-} && -x ${DISPLAYLINK_SOURCE_DIR}/DisplayLinkManager ]]; then
+            source_dir=$DISPLAYLINK_SOURCE_DIR
+        elif [[ -x /usr/libexec/displaylink/DisplayLinkManager ]]; then
             source_dir=/usr/libexec/displaylink
         else
             source_dir=
